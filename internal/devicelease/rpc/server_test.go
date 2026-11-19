@@ -66,7 +66,7 @@ func TestRawCacheAuthenticatedRPC(t *testing.T) {
 	const controller = "spiffe://test/controller/n1"
 	const other = "spiffe://test/other/n1"
 	const node = "spiffe://test/node/n1"
-	p := policy{"vg-uuid", []Grant{
+	p := policy{Provider: "vg-uuid", Grants: []Grant{
 		{URI: controller, NodeID: "n1", Role: "controller", Composites: []string{"vol"}},
 		{URI: other, NodeID: "n1", Role: "controller", Composites: []string{"other"}},
 		{URI: node, NodeID: "n1", Role: "node", Composites: []string{"vol"}},
@@ -74,29 +74,7 @@ func TestRawCacheAuthenticatedRPC(t *testing.T) {
 	if _, err := p.authorize("n2"); err == nil {
 		t.Fatal("accepted policy for another node")
 	}
-	auth, err := p.authorize("n1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	roots, issue := certificates(t)
-	server := newServer(issue(""), roots, p.Provider, auth, db)
-	wire := bufconn.Listen(1 << 20)
-	go func() { _ = server.Serve(wire) }()
-	t.Cleanup(server.Stop)
-	client := func(uri string) pb.DeviceProviderClient {
-		cfg := &tls.Config{RootCAs: roots, ServerName: "provider.test", MinVersion: tls.VersionTLS13}
-		if uri != "" {
-			cfg.Certificates = []tls.Certificate{issue(uri)}
-		}
-		cc, err := grpc.NewClient("passthrough:///provider.test",
-			grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return wire.DialContext(ctx) }),
-			grpc.WithTransportCredentials(credentials.NewTLS(cfg)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = cc.Close() })
-		return pb.NewDeviceProviderClient(cc)
-	}
+	client := authenticatedClients(t, p, db, nil)
 	check := func(err error, want codes.Code) {
 		t.Helper()
 		if status.Code(err) != want {
@@ -181,6 +159,145 @@ func TestRawCacheAuthenticatedRPC(t *testing.T) {
 	check(err, codes.Unavailable)
 	_, err = writer.GetCapacity(ctx, pool)
 	check(err, codes.Unavailable)
+}
+
+func authenticatedClients(t *testing.T, p policy, db *devicelease.Provider, proof devicelease.Authority) func(string) pb.DeviceProviderClient {
+	t.Helper()
+	auth, err := p.authorize("n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots, issue := certificates(t)
+	server := newServer(issue(""), roots, p.Provider, auth, db, proof)
+	wire := bufconn.Listen(1 << 20)
+	go func() { _ = server.Serve(wire) }()
+	t.Cleanup(server.Stop)
+	return func(uri string) pb.DeviceProviderClient {
+		t.Helper()
+		cfg := &tls.Config{RootCAs: roots, ServerName: "provider.test", MinVersion: tls.VersionTLS13}
+		if uri != "" {
+			cfg.Certificates = []tls.Certificate{issue(uri)}
+		}
+		cc, err := grpc.NewClient("passthrough:///provider.test",
+			grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return wire.DialContext(ctx) }),
+			grpc.WithTransportCredentials(credentials.NewTLS(cfg)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cc.Close() })
+		return pb.NewDeviceProviderClient(cc)
+	}
+}
+
+type handoffMedia struct{ media }
+
+func (m *handoffMedia) Activate(_ context.Context, r devicelease.Reservation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v := &m.volumes[0]
+	if !v.Inactive || v.UUID != r.StableDeviceID {
+		return devicelease.ErrUncertain
+	}
+	v.Active, v.Inactive, v.Major, v.Minor = true, false, 253, 7
+	return nil
+}
+func (m *handoffMedia) Prepare(context.Context, devicelease.Reservation, devicelease.Volume, bool) error {
+	return nil
+}
+func (m *handoffMedia) Deactivate(context.Context, devicelease.Reservation, devicelease.Volume) error {
+	return devicelease.ErrHeld
+}
+func (m *handoffMedia) ConfirmInactive(context.Context, devicelease.Reservation) error {
+	return devicelease.ErrHeld
+}
+
+type enrolled struct{ owner devicelease.Owner }
+
+func (a *enrolled) Enrolled(o devicelease.Owner) error {
+	if o != a.owner {
+		return devicelease.ErrHeld
+	}
+	return nil
+}
+func (a *enrolled) Opened(o devicelease.Owner, v devicelease.Volume) error {
+	if !v.Open || v.UUID != a.owner.StableDeviceID {
+		return devicelease.ErrHeld
+	}
+	return a.Enrolled(o)
+}
+func (*enrolled) Closed(devicelease.Owner, string) error { return devicelease.ErrHeld }
+
+func TestScopedCustodyRPC(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	m := new(handoffMedia)
+	db, err := devicelease.Open(dir, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	if err := db.Initialize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r, err := db.Reserve(ctx, "reserve", "vol", 4097)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alloc := lease(r).Allocation
+	o := &pb.Owner{NodeId: "n1", OwnerEpoch: 1, Allocation: alloc}
+	proof := &enrolled{owner: devicelease.Owner{PoolUUID: r.PoolUUID, CompositeID: r.CompositeID, LeaseID: r.LeaseID,
+		StableDeviceID: r.StableDeviceID, ResourceID: alloc.ResourceId, Generation: r.Generation, NodeID: "n1", Epoch: 1}}
+	const node = "spiffe://test/custody/n1"
+	const other = "spiffe://test/other/n1"
+	p := policy{Provider: r.PoolUUID, Grants: []Grant{
+		{URI: node, Role: "node", NodeID: "n1", Composites: []string{"vol"}},
+		{URI: other, Role: "node", NodeID: "n1", Composites: []string{"other"}},
+	}}
+	q := &pb.AcquireRequest{Owner: o, RequestId: "acquire"}
+	// Even a fully capable backend and valid proof do not turn custody on.
+	if _, err := authenticatedClients(t, p, db, proof)(node).Acquire(ctx, q); status.Code(err) != codes.Unavailable {
+		t.Fatal(err)
+	}
+	p.LocalCustody = true
+	client := authenticatedClients(t, p, db, proof)
+	c, unauthorized := client(node), client(other)
+	got, err := c.Acquire(ctx, q)
+	if err != nil || got.State != pb.LeaseState_LEASE_STATE_ACQUIRED || got.NodeId != "n1" {
+		t.Fatal(got, err)
+	}
+	if _, err := unauthorized.Acquire(ctx, q); status.Code(err) != codes.PermissionDenied {
+		t.Fatal("out-of-scope replay", err)
+	}
+	wrong := proto.Clone(q).(*pb.AcquireRequest)
+	wrong.Owner.NodeId = "n2"
+	if _, err := c.Acquire(ctx, wrong); status.Code(err) != codes.PermissionDenied {
+		t.Fatal("wrong node", err)
+	}
+	replay, err := c.Acquire(ctx, q)
+	if err != nil || !proto.Equal(got, replay) {
+		t.Fatal(replay, err)
+	}
+	m.mu.Lock()
+	m.volumes[0].Open = true
+	m.mu.Unlock()
+	check := &pb.ValidateRequest{Owner: o, Opened: &pb.OpenedDevice{StableDeviceId: r.StableDeviceID, DeviceGeneration: r.Generation, CapacityBytes: 8192, ObservedMajor: 253, ObservedMinor: 7}}
+	if _, err := c.Validate(ctx, check); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unauthorized.Validate(ctx, check); status.Code(err) != codes.PermissionDenied {
+		t.Fatal(err)
+	}
+}
+
+func TestScopeOwnerRejectsUnknownRequest(t *testing.T) {
+	g := Grant{Role: "node", NodeID: "n1", AllComposites: true}
+	ctx := context.WithValue(t.Context(), grantKey{}, g)
+	if err := scopeOwner(ctx, &pb.Capacity{}, g, "vg"); status.Code(err) != codes.PermissionDenied {
+		t.Fatal(err)
+	}
 }
 
 func certificates(t *testing.T) (*x509.CertPool, func(string) tls.Certificate) {

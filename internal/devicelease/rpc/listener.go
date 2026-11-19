@@ -35,8 +35,9 @@ type Grant struct {
 	AllComposites bool     `json:"allComposites"`
 }
 type policy struct {
-	Provider string  `json:"provider"`
-	Grants   []Grant `json:"grants"`
+	Provider     string  `json:"provider"`
+	Grants       []Grant `json:"grants"`
+	LocalCustody bool    `json:"localCustody"`
 }
 
 func (p policy) authorize(node string) (grpc.UnaryServerInterceptor, error) {
@@ -90,10 +91,17 @@ func (p policy) authorize(node string) (grpc.UnaryServerInterceptor, error) {
 			if g.Role != "controller" {
 				return nil, denied
 			}
+		case pb.DeviceProvider_Acquire_FullMethodName, pb.DeviceProvider_Validate_FullMethodName,
+			pb.DeviceProvider_Renew_FullMethodName, pb.DeviceProvider_Release_FullMethodName:
+			// Recheck node and composite scope even for a historical replay.
+			if err := scopeOwner(ctx, req, g, p.Provider); err != nil {
+				return nil, err
+			}
+			if !p.LocalCustody {
+				return nil, blocked
+			}
 		default:
-			// No request, including an exact replay, can grant access, extend a
-			// deadline or release ownership. Never admit these request IDs.
-			return nil, blockedOperation(ctx, req, g, p.Provider)
+			return nil, denied
 		}
 		select {
 		case slots <- struct{}{}:
@@ -141,15 +149,19 @@ func New(address, directory, node string, db *devicelease.Provider) (*Listener, 
 	if err != nil {
 		return nil, err
 	}
-	s := newServer(cert, roots, p.Provider, auth, db)
+	var authority devicelease.Authority
+	if p.LocalCustody {
+		authority = custodian(filepath.Join(directory, "custody.sock"))
+	}
+	s := newServer(cert, roots, p.Provider, auth, db, authority)
 	return &Listener{address: address, server: s}, nil
 }
 
-func newServer(cert tls.Certificate, roots *x509.CertPool, provider string, auth grpc.UnaryServerInterceptor, db *devicelease.Provider) *grpc.Server {
+func newServer(cert tls.Certificate, roots *x509.CertPool, provider string, auth grpc.UnaryServerInterceptor, db *devicelease.Provider, authority devicelease.Authority) *grpc.Server {
 	s := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{
 		MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: roots, Certificates: []tls.Certificate{cert},
 	})), grpc.UnaryInterceptor(auth), grpc.MaxRecvMsgSize(64<<10), grpc.MaxConcurrentStreams(16))
-	pb.RegisterDeviceProviderServer(s, &service{provider: provider, db: db})
+	pb.RegisterDeviceProviderServer(s, &service{provider: provider, db: db, authority: authority})
 	return s
 }
 

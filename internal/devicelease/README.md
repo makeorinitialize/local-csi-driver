@@ -3,7 +3,7 @@
 This is the allocation portion of a raw cache provider, not a second PVC,
 CSI capability or attachment service. It supports administrator `init`,
 `reserve` and `inspect`, and optionally the DeviceProvider v1 reservation
-RPCs. None returns a device path, activates an LV or grants IO.
+RPCs. By default none returns a device path, activates an LV or grants IO.
 
 ## Opt in
 
@@ -102,18 +102,69 @@ public Go plugins). No private Go dependency is required.
    receipt and current inventory. The resource ID is opaque, not a device
    path. Unknown state is `UNAVAILABLE`, not `NOT_FOUND` or zero capacity.
 
-## Blocked operations and rollback
+## Optional local handoff
 
-`Acquire`, `Validate`, `Renew` and `Release` cannot succeed, including on
-replay. In-scope callers receive `UNAVAILABLE`. There is no node claim,
-opened-device validation, renewal, release, wipe or reuse. A raw LV may contain
-old data. Do not activate it or expose it to a workload. A production grant
-requires independent exclusive-access authority, sanitation and opened-device
-attestation. Releasing a node would additionally require authenticated,
-immutable teardown evidence for the exact allocation, node and epoch, plus
-proof that the former owner can no longer issue IO. Elapsed time, an absent
-mount, a caller-provided string or a momentary zero open count cannot do that.
-Nothing in this implementation turns uncertainty or expiry into teardown.
+Set `"localCustody": true` in the node's RPC policy **only** with a separate
+trusted custodian at `/etc/acs-dmstack-provider/custody.sock`. No custodian
+is installed by ACS. Without one, no IO handoff or cleanup can succeed.
+Only the existing, authenticated `node` role for the exact node/composite may
+acquire, validate, renew or release its node claim. The allocation remains
+charged after release. Allocation destruction/reuse is still unavailable.
+
+The custodian must control **all** raw access on this dedicated, non-shared
+node. Local root, arbitrary privileged pods, VG aliases/clones, externally
+modified device tables or untrusted code able to replace the socket invalidate
+this assumption. There is no cross-node fencing or dependency on a remote
+owner. Keep the node clock trustworthy. This is not a storage transport.
+
+ACS connects to the root-owned custodian process over `SOCK_SEQPACKET`
+(`SO_PEERCRED`), one bounded request per connection. Each request is a JSON
+object with `Version: 1`, a fresh hex `Nonce`, `Operation`, `Receipt` and
+`Owner`. The owner fields are `PoolUUID`, `CompositeID`, `LeaseID`,
+`ResourceID`, `StableDeviceID`, `NodeID`, `Generation` and `Epoch`.
+Reply with `{"Challenge": <exact request>, "Confirmed": true}` **only**
+after independently proving the following; never just echo a facade request:
+
+- `enrolled`: access is exclusively mediated by this custodian on this
+  node, for this LV incarnation and owner epoch; no prior writer can open
+  it. Before the first grant, prevent clients opening the mapping while
+  ACS activates, inspects and zeroes it.
+- `opened`: the authorized facade has the device exclusively open for this
+  owner. Include **one `SCM_RIGHTS` duplicate of that open description**,
+  retaining the original. ACS checks block type, dev_t, kernel DM UUID,
+  capacity and the enrolled generation against current LVM inventory and
+  `Validate.opened`. No device path from the caller is opened.
+- `closed`: independently resolve the supplied immutable receipt ID for
+  completed teardown of this exact owner. All its users, mappings and
+  descriptor copies are gone and access cannot reopen for that epoch.
+  Do not attach descriptors for `enrolled` or `closed`. The custodian
+  must not call back into the provider while it holds the local journal lock.
+
+The first grant takes the journal lock, persists the owner **before**
+activation, verifies the mapping, and zeroes and flushes the entire LV via
+an exclusive, identity-checked FD. This can take minutes and serializes
+other local provider operations. Later epochs on the same allocation do
+not wipe its data. Renew before the returned one-minute deadline; expiry
+retains the owner and never deactivates the mapping. A crash during first
+preparation intentionally strands that intent for operator reconciliation,
+rather than repeating a potentially destructive zero. A lost committed
+reply is replayable without activation or wiping.
+
+Node release also requires zero opens, no sysfs holders, a UUID-selected
+non-forced deactivation, matching inactive LV metadata and no matching
+kernel DM UUID. On ambiguity retain ownership. Retry the identical release
+after restoring evidence; replay of a committed release only acknowledges
+history, never touches a successor. Do not discard an uncertain journal.
+
+## Rollback
+
+The first admitted owner mutation upgrades the local journal to version 2.
+Fresh IDs rejected before an owner transition (for example a stale generation
+or epoch) are not journaled. Admission binds the ID and input in the same
+durable snapshot as the transition, before any activation or deactivation.
+Reservation-only binaries cannot read it. Turning off `localCustody` blocks
+new owner operations; it does not clean up existing owners or migrate the
+journal. Preserve the journal and assets, including for interrupted handoffs.
 
 CSI/GC protections remain active when `rawCache.enabled` is switched off.
 The directory is then unmounted, not erased. Roll out the protecting binary

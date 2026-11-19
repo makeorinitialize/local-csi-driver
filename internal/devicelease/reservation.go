@@ -33,10 +33,12 @@ type Pool struct {
 }
 
 type Volume struct {
-	Name, UUID string
-	Bytes      int64
-	Tags       []string
-	Inactive   bool
+	Name, UUID   string
+	Bytes        int64
+	Tags         []string
+	Inactive     bool
+	Active, Open bool
+	Major, Minor uint32
 }
 
 // Reservation has no device path. A reservation is never an IO grant.
@@ -44,6 +46,7 @@ type Reservation struct {
 	PoolUUID, CompositeID, LeaseID, StableDeviceID string
 	Generation                                     uint64
 	RequestedBytes, CapacityBytes                  int64
+	Claim                                          *Claim `json:",omitempty"`
 }
 
 func (r Reservation) name() string { return "raw-" + r.LeaseID }
@@ -55,8 +58,9 @@ type ledger struct {
 	Version  int
 	PoolUUID string
 	// No record or request key is ever removed in v1.
-	Records  map[string]Reservation // composite -> incarnation
-	Requests map[string]reserveIntent
+	Records   map[string]Reservation // composite -> incarnation
+	Requests  map[string]reserveIntent
+	Mutations map[string]mutation `json:",omitempty"`
 }
 
 type reserveIntent struct {
@@ -104,12 +108,13 @@ func (p Provider) Lookup(ctx context.Context, poolUUID, leaseID string) (Reserva
 		return Reservation{}, errors.New("pool UUID and lease ID required")
 	}
 	var result Reservation
-	err := withLedger(p.directory, func(s *ledger, _ func() error) error {
+	err := withLedger(p.directory, func(s *ledger, save func() error) error {
 		pool, err := p.backend.Inspect(ctx)
 		if err != nil {
 			return fmt.Errorf("%w: %w", ErrUncertain, err)
 		}
-		if _, err := s.reconcile(pool); err != nil {
+		found, err := s.reconcile(pool)
+		if err != nil {
 			return err
 		}
 		if poolUUID != pool.UUID {
@@ -121,12 +126,15 @@ func (p Provider) Lookup(ctx context.Context, poolUUID, leaseID string) (Reserva
 					return ErrUncertain
 				}
 				result = r
-				return nil
+				return snapshot(r, found[r.CompositeID], save)
 			}
 		}
 		return ErrNotFound
 	})
-	return result, err
+	if err != nil {
+		return Reservation{}, err
+	}
+	return result, nil
 }
 
 // Reserve serializes durable admission and the one create attempt across
@@ -157,6 +165,9 @@ func (p Provider) reserve(ctx context.Context, poolUUID, request, composite stri
 			return ErrUncertain
 		}
 		input := reserveIntent{CompositeID: composite, Bytes: bytes}
+		if _, ok := s.Mutations[request]; ok {
+			return ErrConflict
+		}
 		if old, ok := s.Requests[request]; ok {
 			if old != input {
 				return ErrConflict
@@ -220,7 +231,7 @@ func (p Provider) reserve(ctx context.Context, poolUUID, request, composite stri
 			}
 		}
 		result = r
-		return nil
+		return snapshot(r, lv, save)
 	})
 	if err != nil {
 		return Reservation{}, err
@@ -242,7 +253,8 @@ func (s *ledger) reconcile(pool Pool) (map[string]Volume, error) {
 	ids := make(map[string]bool)
 	for _, lv := range pool.Volumes {
 		r, ok := byName[lv.Name]
-		if !ok || !lv.Inactive || lv.UUID == "" || ids[lv.UUID] || lv.Bytes < r.RequestedBytes ||
+		activeAllowed := r.Claim != nil && r.Claim.Phase != ""
+		if !ok || (!lv.Inactive && !(activeAllowed && lv.Active)) || lv.UUID == "" || ids[lv.UUID] || lv.Bytes < r.RequestedBytes ||
 			(r.StableDeviceID != "" && (r.StableDeviceID != lv.UUID || r.CapacityBytes != lv.Bytes)) ||
 			!matchTags(lv.Tags, r.tags()) {
 			return nil, fmt.Errorf("%w: unexpected LV or changed identity", ErrUncertain)
@@ -277,7 +289,7 @@ func matchTags(got, want []string) bool {
 }
 
 func (s *ledger) validate() error {
-	if s.Version != 1 || s.Records == nil || s.Requests == nil || s.PoolUUID == "" {
+	if (s.Version != 1 && s.Version != 2) || (s.Version == 2) != (len(s.Mutations) > 0) || s.Records == nil || s.Requests == nil || s.PoolUUID == "" {
 		return ErrUncertain
 	}
 	seen := map[string]bool{}
@@ -300,5 +312,5 @@ func (s *ledger) validate() error {
 		}
 		seen[r.LeaseID], gens[r.Generation] = true, true
 	}
-	return nil
+	return s.validateClaims()
 }

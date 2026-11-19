@@ -46,8 +46,18 @@ func (b Backend) Inspect(ctx context.Context) (devicelease.Pool, error) {
 		}
 		inactive := len(lv.Attributes) == 10 && lv.Attributes[0] == '-' && lv.Attributes[4:6] == "--" &&
 			bool(lv.SkipActivation) && !bool(lv.ActiveLocally) && !bool(lv.ActiveRemotely)
-		p.Volumes = append(p.Volumes, devicelease.Volume{Name: lv.Name, UUID: lv.UUID, Bytes: int64(lv.Size),
-			Tags: strings.Split(lv.Tags, ","), Inactive: inactive})
+		v := devicelease.Volume{Name: lv.Name, UUID: lv.UUID, Bytes: int64(lv.Size),
+			Tags: strings.Split(lv.Tags, ","), Inactive: inactive}
+		if len(lv.Attributes) == 10 && lv.Attributes[0] == '-' && lv.Attributes[4] == 'a' && lv.Attributes[8] == '-' &&
+			(lv.Attributes[5] == '-' || lv.Attributes[5] == 'o') && lv.SkipActivation && lv.ActiveLocally && !lv.ActiveRemotely {
+			major, e1 := strconv.ParseUint(lv.KernelMajor, 10, 32)
+			minor, e2 := strconv.ParseUint(lv.KernelMinor, 10, 32)
+			if e1 != nil || e2 != nil || major == 0 {
+				return devicelease.Pool{}, fmt.Errorf("unknown active LV device number")
+			}
+			v.Active, v.Open, v.Major, v.Minor = true, lv.Attributes[5] == 'o', uint32(major), uint32(minor)
+		}
+		p.Volumes = append(p.Volumes, v)
 	}
 	return p, nil
 }

@@ -19,8 +19,9 @@ import (
 
 type service struct {
 	pb.UnimplementedDeviceProviderServer
-	db       *devicelease.Provider
-	provider string // immutable local VG UUID; never a routing alias
+	db        *devicelease.Provider
+	provider  string // immutable local VG UUID; never a routing alias
+	authority devicelease.Authority
 }
 
 type grantKey struct{}
@@ -36,16 +37,18 @@ var (
 	blocked = status.Error(codes.Unavailable, "independent node access and teardown authority unavailable")
 )
 
-func blockedOperation(ctx context.Context, req any, g Grant, provider string) error {
+func scopeOwner(ctx context.Context, req any, g Grant, provider string) error {
 	var a *pb.Allocation
+	var o *pb.Owner
 	switch r := req.(type) {
-	case interface{ GetOwner() *pb.Owner }:
-		if g.Role != "node" || r.GetOwner().GetNodeId() != g.NodeID {
-			return denied
-		}
-		a = r.GetOwner().GetAllocation()
+	case *pb.AcquireRequest:
+		o = r.GetOwner()
+	case *pb.ValidateRequest:
+		o = r.GetOwner()
+	case *pb.RenewRequest:
+		o = r.GetOwner()
 	case *pb.ReleaseRequest:
-		switch r.Mode {
+		switch r.GetMode() {
 		case pb.ReleaseMode_RELEASE_MODE_NODE:
 			if g.Role != "node" || r.NodeId != g.NodeID {
 				return denied
@@ -59,12 +62,21 @@ func blockedOperation(ctx context.Context, req any, g Grant, provider string) er
 		}
 		a = r.Allocation
 	default:
-		return blocked
+		return denied
+	}
+	if o != nil {
+		if g.Role != "node" || o.NodeId != g.NodeID {
+			return denied
+		}
+		a = o.Allocation
 	}
 	if a.GetKey().GetProvider() != provider || !permitted(ctx, a.GetCompositeVolumeId()) {
 		return denied
 	}
-	return blocked
+	if r, ok := req.(*pb.ReleaseRequest); ok && r.Mode == pb.ReleaseMode_RELEASE_MODE_ALLOCATION {
+		return blocked
+	}
+	return nil
 }
 
 func (s *service) pool(p *pb.Pool) error {
@@ -125,6 +137,10 @@ func (s *service) GetLease(ctx context.Context, key *pb.LeaseKey) (*pb.Lease, er
 
 func rpcError(err error) error {
 	switch {
+	case errors.Is(err, devicelease.ErrStale):
+		return status.Error(codes.Aborted, "stale identity or epoch")
+	case errors.Is(err, devicelease.ErrHeld):
+		return status.Error(codes.FailedPrecondition, "ownership retained")
 	case errors.Is(err, devicelease.ErrNotFound):
 		return status.Error(codes.NotFound, "lease not found")
 	case errors.Is(err, devicelease.ErrConflict):
@@ -137,8 +153,21 @@ func rpcError(err error) error {
 }
 
 func lease(r devicelease.Reservation) *pb.Lease {
-	return &pb.Lease{Allocation: &pb.Allocation{Key: &pb.LeaseKey{Provider: r.PoolUUID, LeaseId: r.LeaseID},
+	l := &pb.Lease{Allocation: &pb.Allocation{Key: &pb.LeaseKey{Provider: r.PoolUUID, LeaseId: r.LeaseID},
 		CompositeVolumeId: r.CompositeID, ResourceId: devicelease.Group + "/raw-" + r.LeaseID,
 		StableDeviceId: r.StableDeviceID, DeviceGeneration: r.Generation},
 		PoolId: devicelease.Group, CapacityBytes: uint64(r.CapacityBytes), State: pb.LeaseState_LEASE_STATE_RESERVED}
+	if c := r.Claim; c != nil {
+		l.OwnerEpoch = c.Epoch
+		if c.Phase != "" {
+			l.NodeId, l.RenewByUnixSeconds = c.Node, c.Deadline
+			l.State = pb.LeaseState_LEASE_STATE_HELD
+			if c.Phase == "acquired" {
+				l.State = pb.LeaseState_LEASE_STATE_ACQUIRED
+				l.ObservedDevicePath = "/dev/" + l.Allocation.ResourceId
+				l.ObservedMajor, l.ObservedMinor = c.Major, c.Minor
+			}
+		}
+	}
+	return l
 }
