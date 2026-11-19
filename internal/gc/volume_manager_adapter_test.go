@@ -11,10 +11,18 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"local-csi-driver/internal/csi/core/lvm"
+	"local-csi-driver/internal/devicelease"
 	lvmMgr "local-csi-driver/internal/pkg/lvm"
 	"local-csi-driver/internal/pkg/probe"
 	"local-csi-driver/internal/pkg/telemetry"
 )
+
+func TestRawCacheGCCannotRemove(t *testing.T) {
+	adapter := &lvmVolumeManagerAdapter{lvmManager: lvmMgr.NewMockManager(gomock.NewController(t))}
+	if err := adapter.DeleteVolume(t.Context(), devicelease.Group+"#raw-test"); err == nil {
+		t.Fatal("accepted provider LV")
+	}
+}
 
 func TestLVMVolumeManagerAdapterRemovesImmediatelyWhenWipeDisabled(t *testing.T) {
 	t.Parallel()

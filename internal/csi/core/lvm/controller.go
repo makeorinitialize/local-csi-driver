@@ -19,6 +19,7 @@ import (
 
 	"local-csi-driver/internal/csi/capability"
 	"local-csi-driver/internal/csi/core"
+	"local-csi-driver/internal/devicelease"
 	"local-csi-driver/internal/pkg/events"
 	"local-csi-driver/internal/pkg/lvm"
 	"local-csi-driver/internal/pkg/probe"
@@ -270,6 +271,9 @@ func (l *LVM) List(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListV
 	entries := make([]*csi.ListVolumesResponse_Entry, 0)
 
 	for _, vg := range vgs {
+		if vg.Name == devicelease.Group {
+			continue
+		}
 		log.V(2).Info("listing logical volumes from volume group", "vg", vg.Name)
 		span.SetAttributes(attribute.String("vol.group", vg.Name))
 
@@ -375,6 +379,9 @@ func (l *LVM) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*cs
 
 // TODO(sc): use a cache.
 func (l *LVM) AvailableCapacity(ctx context.Context, vgName string) (int64, error) {
+	if !devicelease.OrdinaryTarget(vgName, "volume") {
+		return 0, nil // not a CSI pool
+	}
 	log := log.FromContext(ctx)
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/AvailableCapacity", trace.WithAttributes(
 		attribute.String("vol.group", vgName),

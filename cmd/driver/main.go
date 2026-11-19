@@ -67,6 +67,13 @@ func init() {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "raw-cache" {
+		if err := rawCache(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	var nodeName string
 	var podName string
 	var podUID string
@@ -92,10 +99,12 @@ func main() {
 	var volumeWipeEnabled bool
 	var volumeWipeInterval time.Duration
 	var volumeWipeConcurrency int
+	var rawCacheRPCPort int
 	var runAlongsideWebhook bool
 	var diskPathPrefixes string
 	var diskModels string
 	var diskTypes string
+	flag.IntVar(&rawCacheRPCPort, "raw-cache-rpc-port", 0, "Dedicated mTLS DeviceProvider port; zero disables serving.")
 	flag.StringVar(&nodeName, "node-name", "",
 		"The name of the node this agent is running on.")
 	flag.StringVar(&podName, "pod-name", "",
@@ -280,6 +289,16 @@ func main() {
 	lvmMgr := lvmMgr.NewClient(lvmMgr.WithTracerProvider(tp), lvmMgr.WithBlockDeviceUtilities(blockDevUtils))
 	if !lvmMgr.IsSupported() {
 		logAndExit(fmt.Errorf("lvm is not supported on this node"), "lvm is not supported")
+	}
+
+	if rawCacheRPCPort != 0 {
+		listener, err := rawCacheListener(rawCacheRPCPort, nodeName, lvmMgr)
+		if err != nil {
+			logAndExit(err, "invalid raw-cache RPC configuration")
+		}
+		if err := mgr.Add(listener); err != nil {
+			logAndExit(err, "cannot register raw-cache RPC listener")
+		}
 	}
 
 	// Create the LVM CSI server.

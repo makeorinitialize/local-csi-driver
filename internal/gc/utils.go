@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 
+	"local-csi-driver/internal/devicelease"
+
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -51,5 +53,8 @@ func parseVolumeID(volumeID string) (vgName, lvName string, err error) {
 		return "", "", fmt.Errorf("error parsing volume id: %q, logical volume name is empty", volumeID)
 	}
 
+	if !devicelease.OrdinaryTarget(vgName, lvName) {
+		return "", "", fmt.Errorf("reserved or invalid volume target: %q", volumeID)
+	}
 	return vgName, lvName, nil
 }

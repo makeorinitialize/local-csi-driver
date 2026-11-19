@@ -1,3 +1,8 @@
+{{- $raw := .Values.rawCache | default dict }}
+{{- $rpc := $raw.rpc | default dict }}
+{{- if or (and (hasKey $raw "enabled") (not (kindIs "bool" $raw.enabled))) (and (hasKey $rpc "enabled") (not (kindIs "bool" $rpc.enabled))) }}
+{{- fail "rawCache.enabled and rawCache.rpc.enabled must be booleans" }}{{ end }}
+{{- if and $rpc.enabled (not $raw.enabled) }}{{ fail "rawCache.rpc.enabled requires rawCache.enabled" }}{{ end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -71,6 +76,9 @@ spec:
       - name: driver
         args:
         - --node-name=$(NODE_NAME)
+        {{- if $rpc.enabled }}
+        - --raw-cache-rpc-port={{ required "provider port required" $rpc.port }}
+        {{- end }}
         - --pod-name=$(POD_NAME)
         - --pod-uid=$(POD_UID)
         - --namespace=$(POD_NAMESPACE)
@@ -104,6 +112,10 @@ spec:
         command:
         - /local-csi-driver
         env:
+        {{- if $raw.enabled }}
+        - name: ACS_RAW_CACHE
+          value: "1"
+        {{- end }}
         - name: POD_NAME
           valueFrom:
             fieldRef:
@@ -133,6 +145,10 @@ spec:
           initialDelaySeconds: 15
           periodSeconds: 20
         ports:
+        {{- if $rpc.enabled }}
+        - name: raw-cache-rpc
+          containerPort: {{ $rpc.port }}
+        {{- end }}
         - containerPort: {{ .Values.observability.driver.metrics.port }}
           name: metrics
           protocol: TCP
@@ -154,6 +170,15 @@ spec:
         terminationMessagePath: /tmp/termination-log
         terminationMessagePolicy: FallbackToLogsOnError
         volumeMounts:
+        {{- if $rpc.enabled }}
+        - name: raw-cache-identity
+          mountPath: /etc/acs-dmstack-provider
+          readOnly: true
+        {{- end }}
+        {{- if $raw.enabled }}
+        - name: raw-cache-ledger
+          mountPath: /var/lib/acs-dmstack-raw
+        {{- end }}
         - name: api-credentials
           mountPath: /var/run/secrets/kubernetes.io/serviceaccount
           readOnly: true
@@ -304,6 +329,18 @@ spec:
       terminationGracePeriodSeconds: 60
       tolerations: {{- toYaml .Values.daemonset.tolerations | nindent 8 }}
       volumes:
+      {{- if $rpc.enabled }}
+      - name: raw-cache-identity
+        hostPath:
+          path: /etc/acs-dmstack-provider
+          type: Directory
+      {{- end }}
+      {{- if $raw.enabled }}
+      - name: raw-cache-ledger
+        hostPath:
+          path: /var/lib/acs-dmstack-raw
+          type: Directory
+      {{- end }}
       - name: api-credentials
         projected:
           defaultMode: 420

@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"local-csi-driver/internal/csi/core"
+	"local-csi-driver/internal/devicelease"
 	"local-csi-driver/internal/pkg/events"
 	"local-csi-driver/internal/pkg/lvm"
 	"local-csi-driver/internal/pkg/probe"
@@ -296,6 +297,9 @@ func (l *LVM) EnsureVolumeGroup(ctx context.Context, name string, devices []stri
 		log.Error(fmt.Errorf("volume group name is required"), "vgName", name)
 		span.SetStatus(codes.Error, "volume group name is required")
 		return nil, fmt.Errorf("%w: volume group name is required", core.ErrInvalidArgument)
+	}
+	if !devicelease.OrdinaryTarget(name, "volume") {
+		return nil, fmt.Errorf("%w: reserved or invalid volume group", core.ErrInvalidArgument)
 	}
 	if len(devices) == 0 {
 		log.Error(ErrNoDisksFound, "no disks found")
@@ -781,6 +785,9 @@ func (l *LVM) Cleanup(ctx context.Context) error {
 	}
 
 	for _, vg := range volumeGroup {
+		if vg.Name == devicelease.Group {
+			continue
+		}
 		if err := l.removeVolumeGroup(ctx, vg.Name); err != nil {
 			log.Error(err, "failed to remove volume group", "vg", vg.Name)
 			span.SetStatus(codes.Error, "failed to remove volume group")
@@ -837,6 +844,9 @@ func (l *LVM) removePhysicalVolumes(ctx context.Context, devicePaths []string) e
 		return fmt.Errorf("failed to list physical volumes: %w", err)
 	}
 	for _, pv := range listResult {
+		if pv.VGName == devicelease.Group {
+			continue
+		}
 		pvs[pv.Name] = struct{}{}
 	}
 

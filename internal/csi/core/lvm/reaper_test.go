@@ -16,6 +16,7 @@ import (
 	kevents "k8s.io/client-go/tools/events"
 
 	"local-csi-driver/internal/csi/core/lvm"
+	"local-csi-driver/internal/devicelease"
 	lvmMgr "local-csi-driver/internal/pkg/lvm"
 )
 
@@ -66,6 +67,19 @@ func expectVolumeGroup(m *lvmMgr.MockManager) {
 		ListVolumeGroups(gomock.Any(), gomock.Any()).
 		Return([]lvmMgr.VolumeGroup{{Name: testVolumeGroup}}, nil).
 		AnyTimes()
+}
+
+func TestRawCacheReaperSkipsEvenIfMistagged(t *testing.T) {
+	r := newTestReaper(t, func(m *lvmMgr.MockManager) {
+		m.EXPECT().ListVolumeGroups(gomock.Any(), gomock.Any()).Return([]lvmMgr.VolumeGroup{
+			{Name: devicelease.Group}, {Name: testVolumeGroup},
+		}, nil)
+		m.EXPECT().ListLogicalVolumes(gomock.Any(), &lvmMgr.ListLVOptions{Names: []string{testVolumeGroup}}).
+			Return([]lvmMgr.LogicalVolume{{VGName: devicelease.Group, Name: testWipeName, Tags: lvm.WipePendingTag}}, nil)
+	})
+	if err := r.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Quarantined volume names must have the shape Quarantine generates, prefix

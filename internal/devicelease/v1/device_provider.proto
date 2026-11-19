@@ -1,0 +1,75 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+syntax = "proto3";
+package dmstack.provider.v1;
+option go_package = "local-csi-driver/internal/devicelease/v1;providerv1";
+
+service DeviceProvider {
+  rpc GetCapacity(Pool) returns (Capacity);
+  rpc Reserve(ReserveRequest) returns (Lease);
+  rpc Acquire(AcquireRequest) returns (Lease);
+  rpc Validate(ValidateRequest) returns (ValidateResponse);
+  rpc Renew(RenewRequest) returns (Lease);
+  rpc Release(ReleaseRequest) returns (ReleaseAck);
+  rpc GetLease(LeaseKey) returns (Lease);
+}
+message Pool { string provider = 1; string pool_id = 2; }
+message Capacity { uint64 available_bytes = 1; uint64 max_allocation_bytes = 2; }
+message ReserveRequest {
+  string request_id = 1;
+  Pool pool = 2;
+  string composite_volume_id = 3;
+  uint64 capacity_bytes = 4;
+}
+message LeaseKey { string provider = 1; string lease_id = 2; }
+message Allocation {
+  LeaseKey key = 1;
+  string composite_volume_id = 2;
+  string resource_id = 3;
+  string stable_device_id = 4;
+  uint64 device_generation = 5;
+}
+message Owner { Allocation allocation = 1; string node_id = 2; uint64 owner_epoch = 3; }
+enum LeaseState {
+  LEASE_STATE_UNSPECIFIED = 0;
+  LEASE_STATE_RESERVED = 1;
+  LEASE_STATE_ACQUIRED = 2;
+  LEASE_STATE_HELD = 3;
+}
+message Lease {
+  Allocation allocation = 1;
+  string pool_id = 2;
+  uint64 capacity_bytes = 3;
+  LeaseState state = 4;
+  string node_id = 5;
+  uint64 owner_epoch = 6;
+  int64 renew_by_unix_seconds = 7;
+  string observed_device_path = 8;
+  uint32 observed_major = 9;
+  uint32 observed_minor = 10;
+}
+message AcquireRequest { string request_id = 1; Owner owner = 2; uint64 previous_owner_epoch = 3; }
+message OpenedDevice {
+  string stable_device_id = 1;
+  uint64 device_generation = 2;
+  uint64 capacity_bytes = 3;
+  uint32 observed_major = 4;
+  uint32 observed_minor = 5;
+}
+message ValidateRequest { Owner owner = 1; OpenedDevice opened = 2; }
+message ValidateResponse {}
+message RenewRequest { string request_id = 1; Owner owner = 2; }
+enum ReleaseMode {
+  RELEASE_MODE_UNSPECIFIED = 0;
+  RELEASE_MODE_NODE = 1;
+  RELEASE_MODE_ALLOCATION = 2;
+}
+message ReleaseRequest {
+  string request_id = 1;
+  Allocation allocation = 2;
+  uint64 owner_epoch = 3;
+  ReleaseMode mode = 4;
+  string node_id = 5;
+  string cleanup_receipt_id = 6;
+}
+message ReleaseAck {}

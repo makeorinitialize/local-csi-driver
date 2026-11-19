@@ -18,6 +18,7 @@ import (
 
 	"local-csi-driver/internal/csi/core/lvm"
 	"local-csi-driver/internal/csi/mounter"
+	"local-csi-driver/internal/devicelease"
 	lvmMgr "local-csi-driver/internal/pkg/lvm"
 )
 
@@ -104,6 +105,9 @@ func (r *LVMOrphanScanner) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 
 		for _, lv := range lvs {
+			if lv.VGName == devicelease.Group || !devicelease.OrdinaryTarget(vgName, lv.Name) {
+				continue
+			}
 			// Skip volumes that are already committed to sanitization.
 			//
 			// Such a volume is renamed out of the volume ID namespace and its

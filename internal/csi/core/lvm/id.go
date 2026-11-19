@@ -6,6 +6,8 @@ package lvm
 import (
 	"fmt"
 	"strings"
+
+	"local-csi-driver/internal/devicelease"
 )
 
 const (
@@ -33,6 +35,9 @@ func newVolumeId(vg, lv string) (*volumeId, error) {
 	if len(lv) == 0 {
 		return nil, fmt.Errorf("logical volume name is empty")
 	}
+	if !devicelease.OrdinaryTarget(vg, lv) {
+		return nil, fmt.Errorf("reserved or invalid logical volume target")
+	}
 	return &volumeId{
 		VolumeGroup:   vg,
 		LogicalVolume: lv,
@@ -59,10 +64,7 @@ func newIdFromString(id string) (*volumeId, error) {
 	if isQuarantineName(lv) {
 		return nil, fmt.Errorf("error parsing volume id: %q, logical volume name is reserved", id)
 	}
-	return &volumeId{
-		VolumeGroup:   vg,
-		LogicalVolume: lv,
-	}, nil
+	return newVolumeId(vg, lv)
 }
 
 func (v *volumeId) ReconstructLogicalVolumePath() string {

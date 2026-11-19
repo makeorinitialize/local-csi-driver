@@ -14,12 +14,36 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"local-csi-driver/internal/csi/core/lvm"
+	"local-csi-driver/internal/devicelease"
 	lvmMgr "local-csi-driver/internal/pkg/lvm"
 	"local-csi-driver/internal/pkg/probe"
 	"local-csi-driver/internal/pkg/telemetry"
 )
 
 const testLogicalVolume = "test-lv"
+
+func TestRawCacheOutsideCSILifecycle(t *testing.T) {
+	for _, wipe := range []bool{false, true} {
+		l := newQuarantineTestLVM(t, nil, lvm.WithVolumeWipeEnabled(wipe))
+		for _, id := range []string{devicelease.Group + "#raw-test", "mapper#acs--dmstack--raw--v1-raw--test", "vg#../" + devicelease.Group + "/raw-test"} {
+			if err := l.Delete(t.Context(), &csi.DeleteVolumeRequest{VolumeId: id}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := l.NodeExpandVolume(t.Context(), &csi.NodeExpandVolumeRequest{VolumeId: id}); err == nil {
+				t.Fatal("allowed resize", id)
+			}
+			if _, err := l.GetNodeDevicePath(id); err == nil {
+				t.Fatal("returned path", id)
+			}
+			if err := l.NodeEnsureVolume(t.Context(), id, 1, 0); err == nil {
+				t.Fatal("allowed staging", id)
+			}
+		}
+		if _, err := l.Quarantine(t.Context(), devicelease.Group, "raw-test"); err == nil {
+			t.Fatal("allowed quarantine")
+		}
+	}
+}
 
 // newQuarantineTestLVM builds an LVM core backed by a mock manager.
 func newQuarantineTestLVM(t *testing.T, expect func(*lvmMgr.MockManager), opts ...lvm.Option) *lvm.LVM {

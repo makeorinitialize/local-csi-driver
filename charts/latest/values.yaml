@@ -99,6 +99,13 @@ diskSelection:
   # Additional device types to select, appended to the built-in defaults.
   addonTypes: []
 
+# Inactive raw LV reservations. RPC serving requires a second explicit opt-in.
+rawCache:
+  enabled: false
+  rpc:
+    enabled: false
+    port: 9711
+
 # Garbage collection and cleanup configuration.
 cleanup:
   # Cleanup volume groups and physical volumes on pod termination if logical volume are not in use.
