@@ -65,7 +65,9 @@ func (a receipt) Closed(o devicelease.Owner, id string) error {
 	}
 	return a.Enrolled(o)
 }
-func (a receipt) Opened(devicelease.Owner, devicelease.Volume) error { return devicelease.ErrUncertain }
+func (a receipt) Opened(context.Context, devicelease.Owner, devicelease.Volume) error {
+	return devicelease.ErrUncertain
+}
 
 func TestOrdinaryBlockHoldOrdersPhysicalUnpublish(t *testing.T) {
 	for _, winner := range []string{"hold", "teardown"} {

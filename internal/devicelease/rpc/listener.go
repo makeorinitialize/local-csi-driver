@@ -4,7 +4,9 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -40,6 +42,8 @@ type policy struct {
 	LocalCustody bool    `json:"localCustody"`
 }
 
+type openedPeerKey struct{}
+
 func (p policy) authorize(node string) (grpc.UnaryServerInterceptor, error) {
 	if node == "" || p.Provider == "" || len(p.Grants) == 0 {
 		return nil, errors.New("missing node, provider or grant")
@@ -73,7 +77,7 @@ func (p policy) authorize(node string) (grpc.UnaryServerInterceptor, error) {
 		chain := t.State.VerifiedChains[0]
 		now := time.Now()
 		for _, cert := range chain {
-			if now.Before(cert.NotBefore) || !now.Before(cert.NotAfter) {
+			if cert == nil || now.Before(cert.NotBefore) || !now.Before(cert.NotAfter) {
 				return nil, status.Error(codes.Unauthenticated, "expired client chain")
 			}
 		}
@@ -99,6 +103,13 @@ func (p policy) authorize(node string) (grpc.UnaryServerInterceptor, error) {
 			}
 			if !p.LocalCustody {
 				return nil, blocked
+			}
+			if info.FullMethod == pb.DeviceProvider_Validate_FullMethodName {
+				if len(chain[0].Raw) == 0 || len(t.State.PeerCertificates) == 0 || t.State.PeerCertificates[0] == nil ||
+					!bytes.Equal(chain[0].Raw, t.State.PeerCertificates[0].Raw) {
+					return nil, status.Error(codes.Unauthenticated, "verified client leaf required")
+				}
+				ctx = context.WithValue(ctx, openedPeerKey{}, sha256.Sum256(chain[0].Raw))
 			}
 		default:
 			return nil, denied

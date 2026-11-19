@@ -7,13 +7,17 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
 	"math/big"
 	"net"
 	"net/url"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -163,6 +167,13 @@ func TestRawCacheAuthenticatedRPC(t *testing.T) {
 
 func authenticatedClients(t *testing.T, p policy, db *devicelease.Provider, proof devicelease.Authority) func(string) pb.DeviceProviderClient {
 	t.Helper()
+	call, _ := authenticatedTLSClients(t, p, db, proof)
+	return call
+}
+
+func authenticatedTLSClients(t *testing.T, p policy, db *devicelease.Provider, proof devicelease.Authority) (func(string) pb.DeviceProviderClient, *[]string) {
+	t.Helper()
+	var digests []string
 	auth, err := p.authorize("n1")
 	if err != nil {
 		t.Fatal(err)
@@ -177,6 +188,8 @@ func authenticatedClients(t *testing.T, p policy, db *devicelease.Provider, proo
 		cfg := &tls.Config{RootCAs: roots, ServerName: "provider.test", MinVersion: tls.VersionTLS13}
 		if uri != "" {
 			cfg.Certificates = []tls.Certificate{issue(uri)}
+			sum := sha256.Sum256(cfg.Certificates[0].Certificate[0])
+			digests = append(digests, hex.EncodeToString(sum[:]))
 		}
 		cc, err := grpc.NewClient("passthrough:///provider.test",
 			grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return wire.DialContext(ctx) }),
@@ -186,7 +199,7 @@ func authenticatedClients(t *testing.T, p policy, db *devicelease.Provider, proo
 		}
 		t.Cleanup(func() { _ = cc.Close() })
 		return pb.NewDeviceProviderClient(cc)
-	}
+	}, &digests
 }
 
 type handoffMedia struct{ media }
@@ -211,7 +224,10 @@ func (m *handoffMedia) ConfirmInactive(context.Context, devicelease.Reservation)
 	return devicelease.ErrHeld
 }
 
-type enrolled struct{ owner devicelease.Owner }
+type enrolled struct {
+	owner     devicelease.Owner
+	responder func(challenge) error
+}
 
 func (a *enrolled) Enrolled(o devicelease.Owner) error {
 	if o != a.owner {
@@ -219,11 +235,21 @@ func (a *enrolled) Enrolled(o devicelease.Owner) error {
 	}
 	return nil
 }
-func (a *enrolled) Opened(o devicelease.Owner, v devicelease.Volume) error {
+func (a *enrolled) Opened(ctx context.Context, o devicelease.Owner, v devicelease.Volume) error {
 	if !v.Open || v.UUID != a.owner.StableDeviceID {
 		return devicelease.ErrHeld
 	}
-	return a.Enrolled(o)
+	if err := a.Enrolled(o); err != nil {
+		return err
+	}
+	q, err := openedChallenge(ctx, o)
+	if err != nil {
+		return err
+	}
+	if a.responder != nil {
+		return a.responder(q)
+	}
+	return nil
 }
 func (*enrolled) Closed(devicelease.Owner, string) error { return devicelease.ErrHeld }
 
@@ -262,8 +288,9 @@ func TestScopedCustodyRPC(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.LocalCustody = true
-	client := authenticatedClients(t, p, db, proof)
+	client, leaves := authenticatedTLSClients(t, p, db, proof)
 	c, unauthorized := client(node), client(other)
+	rotated := client(node) // same authorized URI, different leaf DER
 	got, err := c.Acquire(ctx, q)
 	if err != nil || got.State != pb.LeaseState_LEASE_STATE_ACQUIRED || got.NodeId != "n1" {
 		t.Fatal(got, err)
@@ -284,11 +311,59 @@ func TestScopedCustodyRPC(t *testing.T) {
 	m.volumes[0].Open = true
 	m.mu.Unlock()
 	check := &pb.ValidateRequest{Owner: o, Opened: &pb.OpenedDevice{StableDeviceId: r.StableDeviceID, DeviceGeneration: r.Generation, CapacityBytes: 8192, ObservedMajor: 253, ObservedMinor: 7}}
+	// A fixture responder paired with the first leaf. Echo its paired
+	// identity even for another connection, keeping that call's fresh nonce.
+	seen := make(chan string, 2)
+	paired := (*leaves)[0]
+	proof.responder = func(q challenge) error {
+		seen <- q.OpenedPeerSHA256
+		q2 := q
+		q2.OpenedPeerSHA256 = paired
+		data, err := json.Marshal(struct {
+			Challenge challenge
+			Confirmed bool
+		}{q2, true})
+		if err != nil {
+			return err
+		}
+		return checkReply(q, data)
+	}
 	if _, err := c.Validate(ctx, check); err != nil {
 		t.Fatal(err)
 	}
+	if got := <-seen; got != paired {
+		t.Fatalf("first challenge digest %q, want %q", got, paired)
+	}
+	if _, err := rotated.Validate(ctx, check); status.Code(err) != codes.Unavailable {
+		t.Fatal("accepted another leaf's receipt", err)
+	}
+	if got := <-seen; got == paired || got != (*leaves)[2] {
+		t.Fatalf("rotated challenge digest %q, want %q", got, (*leaves)[2])
+	}
 	if _, err := unauthorized.Validate(ctx, check); status.Code(err) != codes.PermissionDenied {
 		t.Fatal(err)
+	}
+
+}
+
+func TestOpenedChallengeRequiresBoundLeaf(t *testing.T) {
+	if _, err := openedChallenge(t.Context(), devicelease.Owner{}); err == nil {
+		t.Fatal("missing verified leaf accepted")
+	}
+	q, err := openedChallenge(context.WithValue(t.Context(), openedPeerKey{}, sha256.Sum256([]byte("fixture"))), devicelease.Owner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"", strings.ToUpper(q.OpenedPeerSHA256), "short", strings.Repeat("x", 64)} {
+		echo := q
+		echo.OpenedPeerSHA256 = bad
+		reply, _ := json.Marshal(struct {
+			Challenge challenge
+			Confirmed bool
+		}{echo, true})
+		if checkReply(q, reply) == nil {
+			t.Fatal("accepted malformed or missing opened peer", bad)
+		}
 	}
 }
 

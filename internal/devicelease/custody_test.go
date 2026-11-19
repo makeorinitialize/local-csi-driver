@@ -53,7 +53,7 @@ func (p proof) Enrolled(o Owner) error {
 	}
 	return nil
 }
-func (p proof) Opened(o Owner, _ Volume) error {
+func (p proof) Opened(_ context.Context, o Owner, _ Volume) error {
 	if !p.open {
 		return ErrUncertain
 	}

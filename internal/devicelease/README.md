@@ -233,7 +233,13 @@ after independently proving the following; never just echo a facade request:
   it. Before the first grant, prevent clients opening the mapping while
   ACS activates, inspects and zeroes it.
 - `opened`: the authorized facade has the device exclusively open for this
-  owner. Include **one `SCM_RIGHTS` duplicate of that open description**,
+  owner. The challenge additionally carries `OpenedPeerSHA256`: 64 lowercase
+  hex characters hashing the verified RPC client's DER leaf certificate.
+  Bind the host's current-FD evidence to that exact peer, not just its URI
+  grant. Echo the field unchanged with the nonce and owner. A missing field
+  or a receipt for a different leaf (even with the same URI) is rejected.
+  ACS uses `custody.sock`; `/etc/acs-dmstack-provider/current-fd.sock` is a
+  separate host protocol. Include **one `SCM_RIGHTS` duplicate of that open description**,
   retaining the original. ACS checks block type, dev_t, kernel DM UUID,
   capacity and the enrolled generation against current LVM inventory and
   `Validate.opened`. No device path from the caller is opened.

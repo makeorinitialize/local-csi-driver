@@ -46,7 +46,7 @@ type LocalMedia interface {
 // otherwise idle node, cannot attest either exclusive access or teardown.
 type Authority interface {
 	Enrolled(Owner) error
-	Opened(Owner, Volume) error
+	Opened(context.Context, Owner, Volume) error
 	Closed(Owner, string) error
 }
 
@@ -430,7 +430,7 @@ func (p Provider) ValidateOpen(ctx context.Context, a Authority, o Owner, size u
 		if !live(c, v) || !v.Open || uint64(v.Bytes) != size || v.Major != major || v.Minor != minor {
 			return ErrUncertain
 		}
-		if err := a.Opened(o, v); err != nil {
+		if err := a.Opened(ctx, o, v); err != nil {
 			return err
 		}
 		return beforeDeadline(c, save)
