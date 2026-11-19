@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"local-csi-driver/internal/csi/core"
 	"local-csi-driver/internal/csi/core/lvm"
 	"local-csi-driver/internal/csi/mounter"
 	"local-csi-driver/internal/devicelease"
@@ -229,6 +230,9 @@ func (r *LVMOrphanScanner) deleteOrphanedVolume(ctx context.Context, volumeID st
 		"Cleaning up orphaned LVM logical volume %s on node %s (no corresponding PV found)", volumeID, r.nodeID)
 
 	// Get device path and unmount before deletion
+	if err := core.BeforePhysical(r.lvmManager, volumeID); err != nil {
+		return err
+	}
 	devicePath, err := r.lvmManager.GetNodeDevicePath(volumeID)
 	if err != nil {
 		log.V(2).Info("Could not get device path, proceeding with deletion", "volumeID", volumeID, "error", err.Error())

@@ -130,6 +130,9 @@ func (l *LVM) Create(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.Vo
 // Delete implements the csi.ControllerServer interface.
 // It deletes the lvm logical volume from the node.
 func (l *LVM) Delete(ctx context.Context, req *csi.DeleteVolumeRequest) error {
+	if err := l.BeforePhysical(req.GetVolumeId(), ""); err != nil {
+		return err
+	}
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/Delete")
 	defer span.End()
 

@@ -83,7 +83,7 @@ func (s *service) pool(p *pb.Pool) error {
 	if p.GetProvider() == "" || p.GetPoolId() == "" || len(p.ProtoReflect().GetUnknown()) != 0 {
 		return invalid
 	}
-	if p.Provider != s.provider || p.PoolId != devicelease.Group {
+	if p.Provider != s.provider || p.PoolId != s.db.PoolID() {
 		return denied
 	}
 	return nil
@@ -154,9 +154,12 @@ func rpcError(err error) error {
 
 func lease(r devicelease.Reservation) *pb.Lease {
 	l := &pb.Lease{Allocation: &pb.Allocation{Key: &pb.LeaseKey{Provider: r.PoolUUID, LeaseId: r.LeaseID},
-		CompositeVolumeId: r.CompositeID, ResourceId: devicelease.Group + "/raw-" + r.LeaseID,
+		CompositeVolumeId: r.CompositeID, ResourceId: r.ResourceID(),
 		StableDeviceId: r.StableDeviceID, DeviceGeneration: r.Generation},
 		PoolId: devicelease.Group, CapacityBytes: uint64(r.CapacityBytes), State: pb.LeaseState_LEASE_STATE_RESERVED}
+	if r.Handle != "" {
+		l.PoolId = devicelease.OrdinaryPool
+	}
 	if c := r.Claim; c != nil {
 		l.OwnerEpoch = c.Epoch
 		if c.Phase != "" {

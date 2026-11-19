@@ -96,10 +96,16 @@ func (o Owner) valid() bool {
 }
 func (o Owner) matches(r Reservation) bool {
 	return o.PoolUUID == r.PoolUUID && o.CompositeID == r.CompositeID && o.LeaseID == r.LeaseID &&
-		o.ResourceID == Group+"/"+r.name() && o.StableDeviceID == r.StableDeviceID && o.Generation == r.Generation
+		o.ResourceID == r.ResourceID() && o.StableDeviceID == r.StableDeviceID && o.Generation == r.Generation
 }
 
 func (p Provider) inventory(ctx context.Context, s *ledger, r Reservation) (Volume, error) {
+	if p.ordinary != nil {
+		if err := p.checkCanary(s); err != nil {
+			return Volume{}, err
+		}
+		return observe(ctx, p.observer, *p.ordinary)
+	}
 	pool, err := p.backend.Inspect(ctx)
 	if err != nil {
 		return Volume{}, errors.Join(ErrUncertain, err)
@@ -127,7 +133,7 @@ func (p Provider) ReleaseNode(ctx context.Context, a Authority, id string, o Own
 
 func (p Provider) change(ctx context.Context, a Authority, id string, m mutation) (Reservation, error) {
 	media, ok := p.backend.(LocalMedia)
-	if !ok || a == nil || !validID(id) || !m.Owner.valid() {
+	if (!ok && p.ordinary == nil) || a == nil || !validID(id) || !m.Owner.valid() {
 		return Reservation{}, ErrUncertain
 	}
 	o := m.Owner
@@ -135,6 +141,14 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 	err := withLedger(p.directory, func(s *ledger, save func() error) error {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if p.ordinary != nil {
+			if err := p.checkCanary(s); err != nil {
+				return err
+			}
+			if o.NodeID != p.ordinary.NodeID {
+				return ErrStale
+			}
 		}
 		if o.PoolUUID != s.PoolUUID {
 			return ErrStale
@@ -151,7 +165,9 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 		// Bind a fresh ID in the same snapshot as its first admitted
 		// transition, before any backend effect. Rejected keys cost no space.
 		record := func() {
-			s.Version = 2
+			if s.Canary == nil {
+				s.Version = 2
+			}
 			if s.Mutations == nil {
 				s.Mutations = map[string]mutation{}
 			}
@@ -160,6 +176,9 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 		if done && m.Method == "release" {
 			return nil
 		} // historical ack only
+		if s.Retired {
+			return ErrStale
+		}
 		r := s.Records[o.CompositeID]
 		if !o.matches(r) {
 			return ErrStale
@@ -203,6 +222,17 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 			}
 			if c.Epoch != m.Previous || o.Epoch <= c.Epoch {
 				return ErrStale
+			}
+			if s.Canary != nil {
+				if err := a.Enrolled(o); err != nil {
+					return err
+				}
+				if err := withUnused(p.observer, *s.Canary, v, func() error { return nil }); err != nil {
+					return err
+				}
+				*c = Claim{Phase: "acquired", Node: o.NodeID, Epoch: o.Epoch, Request: id, Major: v.Major, Minor: v.Minor, Deadline: time.Now().Add(time.Minute).Unix()}
+				s.Records[o.CompositeID] = r
+				break
 			}
 			if !v.Inactive {
 				return ErrUncertain
@@ -268,6 +298,21 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 			}
 			if err := a.Closed(o, m.Receipt); err != nil {
 				return err
+			}
+			if s.Canary != nil {
+				v, err = p.inventory(ctx, s, r)
+				if err != nil {
+					return err
+				}
+				if !live(c, v) {
+					return ErrUncertain
+				}
+				if err := withUnused(p.observer, *s.Canary, v, func() error { return nil }); err != nil {
+					return err
+				}
+				s.Retired = true
+				*c = Claim{Epoch: o.Epoch, Request: id}
+				break
 			}
 			// A dispatched command may have outlived its parent. Do not queue
 			// another deactivation against a name a successor could later use.

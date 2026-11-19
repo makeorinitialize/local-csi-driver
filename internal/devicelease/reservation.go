@@ -43,6 +43,7 @@ type Volume struct {
 
 // Reservation has no device path. A reservation is never an IO grant.
 type Reservation struct {
+	Handle                                         string `json:",omitempty"`
 	PoolUUID, CompositeID, LeaseID, StableDeviceID string
 	Generation                                     uint64
 	RequestedBytes, CapacityBytes                  int64
@@ -55,6 +56,8 @@ func (r Reservation) tags() []string {
 }
 
 type ledger struct {
+	Canary   *Enrollment `json:",omitempty"`
+	Retired  bool        `json:",omitempty"`
 	Version  int
 	PoolUUID string
 	// No record or request key is ever removed in v1.
@@ -69,6 +72,8 @@ type reserveIntent struct {
 }
 
 type Provider struct {
+	ordinary  *Enrollment
+	observer  OrdinaryObserver
 	directory string // fixed, private node-persistent directory
 	backend   Backend
 }
@@ -78,6 +83,10 @@ func validID(s string) bool { return s != "" && utf8.ValidString(s) }
 // Capacity reports only space available for another linear reservation in
 // this provider's exact pool. Unknown inventory is not zero capacity.
 func (p Provider) Capacity(ctx context.Context, poolUUID string) (int64, error) {
+	if p.ordinary != nil {
+		_, n, err := p.ordinaryQuery(ctx, poolUUID, "", "", "", 0)
+		return n, err
+	}
 	var free int64
 	err := withLedger(p.directory, func(s *ledger, _ func() error) error {
 		if poolUUID != s.PoolUUID {
@@ -106,6 +115,10 @@ func (p Provider) Capacity(ctx context.Context, poolUUID string) (int64, error) 
 func (p Provider) Lookup(ctx context.Context, poolUUID, leaseID string) (Reservation, error) {
 	if !validID(poolUUID) || !validID(leaseID) {
 		return Reservation{}, errors.New("pool UUID and lease ID required")
+	}
+	if p.ordinary != nil {
+		r, _, err := p.ordinaryQuery(ctx, poolUUID, "", "", leaseID, 0)
+		return r, err
 	}
 	var result Reservation
 	err := withLedger(p.directory, func(s *ledger, save func() error) error {
@@ -155,6 +168,10 @@ func (p Provider) ReserveInPool(ctx context.Context, poolUUID, request, composit
 func (p Provider) reserve(ctx context.Context, poolUUID, request, composite string, bytes int64) (Reservation, error) {
 	if !validID(request) || !validID(composite) || bytes <= 0 {
 		return Reservation{}, errors.New("request ID, composite ID and positive byte count required")
+	}
+	if p.ordinary != nil {
+		r, _, err := p.ordinaryQuery(ctx, poolUUID, request, composite, "", bytes)
+		return r, err
 	}
 	var result Reservation
 	err := withLedger(p.directory, func(s *ledger, save func() error) error {
@@ -289,7 +306,21 @@ func matchTags(got, want []string) bool {
 }
 
 func (s *ledger) validate() error {
-	if (s.Version != 1 && s.Version != 2) || (s.Version == 2) != (len(s.Mutations) > 0) || s.Records == nil || s.Requests == nil || s.PoolUUID == "" {
+	if s.Canary != nil {
+		e := s.Canary
+		if s.Version != 3 || !e.valid() || e.VGUUID != s.PoolUUID || len(s.Records) > 1 {
+			return ErrUncertain
+		}
+		for _, r := range s.Records {
+			if r.Handle != e.VolumeHandle || r.CompositeID != e.CompositeID || r.Generation != e.Generation || r.StableDeviceID != e.LVUUID || r.CapacityBytes != e.Bytes ||
+				s.Retired != (r.Claim != nil && r.Claim.Phase == "") {
+				return ErrUncertain
+			}
+		}
+	} else if (s.Version != 1 && s.Version != 2) || (s.Version == 2) != (len(s.Mutations) > 0) || s.Retired {
+		return ErrUncertain
+	}
+	if s.Records == nil || s.Requests == nil || s.PoolUUID == "" {
 		return ErrUncertain
 	}
 	seen := map[string]bool{}
@@ -305,7 +336,7 @@ func (s *ledger) validate() error {
 		id, err := hex.DecodeString(r.LeaseID)
 		if !validID(c) || c != r.CompositeID || r.PoolUUID != s.PoolUUID || !intents[reserveIntent{c, r.RequestedBytes}] ||
 			err != nil || len(id) != 16 || hex.EncodeToString(id) != r.LeaseID || seen[r.LeaseID] ||
-			r.Generation == 0 || r.Generation > uint64(len(s.Records)) || gens[r.Generation] ||
+			r.Generation == 0 || s.Canary == nil && (r.Generation > uint64(len(s.Records)) || r.Handle != "") || gens[r.Generation] ||
 			r.RequestedBytes <= 0 || (r.StableDeviceID == "") != (r.CapacityBytes == 0) ||
 			(r.CapacityBytes != 0 && r.CapacityBytes < r.RequestedBytes) {
 			return ErrUncertain

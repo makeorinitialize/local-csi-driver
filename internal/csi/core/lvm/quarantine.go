@@ -69,6 +69,9 @@ const (
 // the same volume ID cannot collide with a volume that is still waiting to be
 // wiped.
 func (l *LVM) Quarantine(ctx context.Context, vgName, lvName string) (string, error) {
+	if err := l.BeforePhysical(vgName+"#"+lvName, ""); err != nil {
+		return "", err
+	}
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/Quarantine", trace.WithAttributes(
 		attribute.String("vol.group", vgName),
 		attribute.String("vol.name", lvName),

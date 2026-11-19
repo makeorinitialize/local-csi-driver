@@ -14,6 +14,8 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/singleflight"
+	grpcCodes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -164,6 +166,7 @@ var (
 )
 
 type LVM struct {
+	ordinary          *devicelease.Provider
 	releaseNamespace  string
 	podName           string
 	nodeName          string
@@ -188,6 +191,23 @@ type LVM struct {
 
 // Option configures an LVM volume manager.
 type Option func(*LVM)
+
+func WithOrdinaryHold(p *devicelease.Provider) Option { return func(l *LVM) { l.ordinary = p } }
+func (l *LVM) BeforePhysical(id, uuid string) error {
+	return holdError(l.ordinary.BeforePhysical(id, uuid))
+}
+func (l *LVM) BeforeUnpublish(id, path string) error {
+	return holdError(l.ordinary.BeforeUnpublish(id, path))
+}
+func holdError(err error) error {
+	if errors.Is(err, devicelease.ErrHeld) {
+		return status.Error(grpcCodes.FailedPrecondition, "ordinary Block volume is held")
+	}
+	if err != nil {
+		return status.Error(grpcCodes.Unavailable, "cannot verify ordinary Block hold")
+	}
+	return nil
+}
 
 // WithVolumeWipeEnabled controls whether deleted volumes are quarantined and
 // sanitized before removal.
@@ -491,6 +511,9 @@ func (l *LVM) ensurePhysicalVolume(ctx context.Context, device string) (*lvm.Phy
 // If the volume already exists, it returns it. Otherwise it creates the
 // volume and returns it.
 func (l *LVM) EnsureVolume(ctx context.Context, volumeId string, capacity int64, limit int64, isMountOperation bool) (int64, error) {
+	if err := l.BeforePhysical(volumeId, ""); err != nil {
+		return 0, err
+	}
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/EnsureVolume", trace.WithAttributes(
 		attribute.String("vol.id", volumeId),
 		attribute.Int64("vol.capacity", capacity),
@@ -784,6 +807,9 @@ func (l *LVM) Cleanup(ctx context.Context) error {
 		return nil
 	}
 
+	if err := l.ordinary.BeforePoolRemoval(); err != nil {
+		return err
+	}
 	for _, vg := range volumeGroup {
 		if vg.Name == devicelease.Group {
 			continue

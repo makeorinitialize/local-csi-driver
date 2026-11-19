@@ -245,6 +245,9 @@ func (cs *Server) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest
 	}
 	span.SetAttributes(attribute.String("device.path", devicePath))
 
+	if err := core.BeforePhysical(cs.volume, req.GetVolumeId()); err != nil {
+		return nil, err
+	}
 	if devicePath != "" {
 		log.V(2).Info("unmounting volume before deletion", "devicePath", devicePath)
 		if err := cs.mounter.CleanupStagingDir(ctx, devicePath); err != nil {

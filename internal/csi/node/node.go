@@ -108,6 +108,9 @@ func (ns *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVol
 	}
 
 	log := log.FromContext(ctx).WithName("NodePublishVolume").WithValues("volumeID", volumeID)
+	if err := core.BeforePhysical(ns.volume, volumeID); err != nil {
+		return nil, err
+	}
 
 	mountOptions := []string{"bind"}
 	if req.GetReadonly() {
@@ -182,6 +185,11 @@ func (ns *Server) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublis
 		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
 	}
 	log := log.FromContext(ctx).WithName("NodeUnpublishVolume").WithValues("volumeID", volumeID)
+	if g, ok := ns.volume.(interface{ BeforeUnpublish(string, string) error }); ok {
+		if err := g.BeforeUnpublish(volumeID, targetPath); err != nil {
+			return nil, err
+		}
+	}
 
 	log.V(2).Info("unmounting volume")
 
@@ -355,6 +363,9 @@ func (ns *Server) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeR
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	log := log.FromContext(ctx).WithName("NodeStageVolume").WithValues("volumeID", volumeID)
+	if err := core.BeforePhysical(ns.volume, volumeID); err != nil {
+		return nil, err
+	}
 
 	pvName, err := ns.volume.GetVolumeName(volumeID)
 	if err != nil {
@@ -545,6 +556,9 @@ func (ns *Server) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVol
 	}
 
 	log := log.FromContext(ctx).WithName("NodeUnstageVolume").WithValues("volumeID", volumeID)
+	if err := core.BeforePhysical(ns.volume, volumeID); err != nil {
+		return nil, err
+	}
 
 	log.V(2).Info("NodeUnstageVolume deferring target path unmount to DeleteVolume")
 

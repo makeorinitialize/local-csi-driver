@@ -151,7 +151,14 @@ func New(address, directory, node string, db *devicelease.Provider) (*Listener, 
 	}
 	var authority devicelease.Authority
 	if p.LocalCustody {
-		authority = custodian(filepath.Join(directory, "custody.sock"))
+		c := custodian(filepath.Join(directory, "custody.sock"))
+		authority = c
+		if db.PoolID() == devicelease.OrdinaryPool {
+			authority = ordinaryCustodian{c}
+		}
+	}
+	if db.PoolID() == devicelease.OrdinaryPool && !p.LocalCustody {
+		return nil, errors.New("ordinary Block hold requires local custody")
 	}
 	s := newServer(cert, roots, p.Provider, auth, db, authority)
 	return &Listener{address: address, server: s}, nil

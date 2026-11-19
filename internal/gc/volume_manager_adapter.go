@@ -36,6 +36,10 @@ type lvmVolumeManagerAdapter struct {
 	mounter    mounter.Interface
 }
 
+func (a *lvmVolumeManagerAdapter) BeforePhysical(id, uuid string) error {
+	return a.lvmCore.BeforePhysical(id, uuid)
+}
+
 func (a *lvmVolumeManagerAdapter) DeleteVolume(ctx context.Context, volumeID string) error {
 	// Parse the volume ID to get volume group and logical volume names
 	// Volume ID format is: <volume-group>#<logical-volume>
@@ -45,6 +49,9 @@ func (a *lvmVolumeManagerAdapter) DeleteVolume(ctx context.Context, volumeID str
 	}
 
 	if !a.lvmCore.IsVolumeWipeEnabled() {
+		if err := a.BeforePhysical(volumeID, ""); err != nil {
+			return err
+		}
 		err := a.lvmManager.RemoveLogicalVolume(ctx, lvmMgr.RemoveLVOptions{
 			Name: vgName + "/" + lvName,
 		})

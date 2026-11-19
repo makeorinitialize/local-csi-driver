@@ -1,5 +1,108 @@
 # Node-local raw cache reservations
 
+## Ordinary ACS Block PV canary (no allocation)
+
+This mode uses **one already provisioned, disposable, normal ACS Block PV
+on its existing node**. It does not create, format, activate, erase, resize,
+rename, or remove that LV. It does not require the dedicated VG below.
+
+1. Verify the PV/PVC, `volumeMode: Block`, CSI driver, node, existing
+   `VG#pvc-<uuid>` handle, actual byte count, and VG/LV UUIDs independently.
+   The trusted operator attests the PV is disposable and not shared. The
+   canary accepts an active healthy normal or RAID0 LV in a local `local-csi`
+   tagged VG; no tagged/quarantined LV, device path or pod annotation is
+   an enrollment. **Provision the PV but leave it unpublished and unconsumed.**
+   Do not stage or publish the backing PVC to a helper, app or other pod.
+   A kubelet bind of a raw block inode can remain even when LVM reports no
+   opener. If already published, complete normal unpublish/unstage and verify
+   the host is clear before attempting enrollment.
+2. Stop all ACS writers on **that node** during enrollment. Use this binary
+   offline with the same persistent `/csi-node` plugin-directory mount,
+   device inventory, `NODE_NAME`, `ACS_RAW_CACHE=1`, and administrator
+   privileges: `/local-csi-driver raw-cache enroll-block < enrollment.json`.
+   Do not run `raw-cache init`. Enrollment input is one object:
+
+   ```json
+   {
+     "NodeID": "worker-a",
+     "CompositeID": "canary-a",
+     "VolumeHandle": "containerstorage#pvc-00000000-0000-0000-0000-000000000001",
+     "VolumeMode": "Block",
+     "VGUUID": "<observed vg_uuid>",
+     "LVUUID": "<observed lv_uuid>",
+     "Generation": 1,
+     "Bytes": 1073741824
+   }
+   ```
+
+   The generation is pinned in the single-use journal, not written to LVM.
+   Use one incarnation only; do not remove/recreate the journal, replace
+   media, or restore either independently. Enrollment writes and syncs a
+   private sibling, publishes it with Linux `RENAME_NOREPLACE`, then syncs
+   the parent. A crash before publication may leave an ignored sibling. An
+   existing final directory, even an empty or corrupt one, is not repaired.
+   Use a local filesystem supporting these operations. Upgraded drivers pin the
+   plugin directory while running so enrollment cannot race an instance
+   that started without the guards. Older binaries do not participate.
+3. Restart only the protecting binary. Use the existing two RPC opt-ins,
+   node-specific mTLS endpoint, `localCustody: true`, exact node/composite
+   grants and independent custodian described below. The unmodified chart
+   still requires its configured host directories. An ordinary enrollment
+   selects the canary backend exclusively on that node: wire `provider` is
+   the **VG UUID**, `pool_id` is `acs-disposable-block`. `Reserve` resolves
+   and durably holds the enrolled LV **only for exactly its observed byte
+   count**. Advisory capacity is this single slot's size when available,
+   zero when known busy, and an error when unknown. Busy, size mismatch
+   and inconclusive first admission do not create a request binding or hold
+   (a failure syncing a dispatched commit still requires exact replay).
+   The opaque `resource_id` is `VG/LV`; preserve
+   case and the exact VG/LV UUIDs. No host paths are accepted from the RPC.
+4. `Acquire` checks node, allocation, generation, epoch, custodian enrollment,
+   no holders/opens and an exclusive identity-checked probe, without writing
+   media. Enrollment and first `Reserve` also check host PID 1's kubelet
+   raw publish mounts (standard `/var/lib/kubelet` layout and host PID
+   namespace required). Reserve keeps the verified exclusive FD open
+   through journal sync under the same lock as ACS teardown. This is not a
+   continuous kernel fence. **Before enrollment**, isolate the node from
+   other consumers: only the trusted custodian may grant future device
+   access. It must prevent *all* unauthorized opens, device-node copies,
+   alternate-namespace mounts and raw writers until handoff/teardown.
+   ACS does not keep an exclusive FD across RPCs. `Validate` requires
+   the actual open file description from the custodian. Losing liveness
+   does not free the volume.
+5. To release the node, the custodian must independently confirm **both**
+   `guest-clean` and `host-unplugged` for the *same* immutable receipt and
+   exact owner. The latter must exclude any further IO/reopen by that guest.
+   ACS rechecks the live identity and absence of holders and takes another
+   exclusive probe. It commits retirement without deactivation. Stale
+   receipts, uncertain inventory, unavailable custodian or open devices
+   leave ordinary teardown blocked. If resolution succeeded but no node
+   ever acquired, there is intentionally no automatic unlock.
+
+The same flock and fsynced journal serialize enrollment/resolve/hold with
+CSI unpublish, unstage, delete (including pre-delete unmount), recovery,
+expand, orphan/failover GC, quarantine, wipe reaper and pool cleanup. This
+driver's unstage is normally a no-op; it still cannot acknowledge unstage
+while held. A conflicting operation that wins *before* resolve durably
+retires the enrollment before invoking the mounter/LVM; resolving later is
+impossible even after restart. Once resolved, those operations fail until
+verified release. This is intentionally single-use, not a way to suspend
+and re-enable arbitrary PVCs. The version-3 journal stays in
+`/csi-node/disposable-block-hold` and is checked even when RPC is disabled.
+For unpublish with an unrelated handle, a missing target DM UUID alone
+is not permission to clean a block inode. ACS verifies the enrolled LV's
+live LVM and kernel identity and distinct device number against its journal,
+or requires durable retirement. Uncertain or conflicting evidence blocks
+cleanup; a successful unrelated cleanup does not change the enrolled hold.
+
+**No online downgrade** with an outstanding hold. Legacy binaries, external
+LVM/root writers, kubelet plugin-directory removal or replacement, and an
+untrusted custodian are outside this interlock. Quiesce and isolate before
+rollback; disabling a chart switch is not proof of guest cleanup. The guest
+agent, host hot-unplug implementation and custodian are not installed here.
+
+## Dedicated raw-cache pool (separate mode)
+
 This is the allocation portion of a raw cache provider, not a second PVC,
 CSI capability or attachment service. It supports administrator `init`,
 `reserve` and `inspect`, and optionally the DeviceProvider v1 reservation

@@ -268,6 +268,9 @@ func (r *Reaper) Reconcile(ctx context.Context) error {
 // longer be reached, so a volume is only ever removed after it has been
 // zeroed in full.
 func (r *Reaper) wipe(ctx context.Context, lv lvm.LogicalVolume) error {
+	if err := r.core.BeforePhysical(lv.VGName+"#"+lv.Name, lv.UUID); err != nil {
+		return err
+	}
 	ctx, span := r.core.tracer.Start(ctx, "volume.lvm.csi/Reaper.wipe", trace.WithAttributes(
 		attribute.String("vol.group", lv.VGName),
 		attribute.String("vol.name", lv.Name),

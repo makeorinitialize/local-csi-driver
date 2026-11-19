@@ -35,6 +35,14 @@ type Interface interface {
 	GetCSIDriver() *storagev1.CSIDriver
 }
 
+// BeforePhysical is optional for backends without ordinary Block holds.
+func BeforePhysical(backend any, id string) error {
+	if g, ok := backend.(interface{ BeforePhysical(string, string) error }); ok {
+		return g.BeforePhysical(id, "")
+	}
+	return nil
+}
+
 type ControllerInterface interface {
 	GetControllerDriverCapabilities() []*csi.ControllerServiceCapability
 	Create(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.Volume, error)

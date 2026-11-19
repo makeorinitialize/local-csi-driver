@@ -18,6 +18,15 @@ import (
 
 type custodian string
 
+type ordinaryCustodian struct{ custodian }
+
+func (c ordinaryCustodian) Closed(o devicelease.Owner, id string) error {
+	if err := c.confirm("guest-clean", o, id, nil); err != nil {
+		return err
+	}
+	return c.confirm("host-unplugged", o, id, nil)
+}
+
 type challenge struct {
 	Version                   int
 	Nonce, Operation, Receipt string

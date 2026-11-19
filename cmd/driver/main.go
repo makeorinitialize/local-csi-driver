@@ -19,6 +19,8 @@ import (
 	"local-csi-driver/internal/csi/core/lvm"
 	"local-csi-driver/internal/csi/mounter"
 	"local-csi-driver/internal/csi/server"
+	"local-csi-driver/internal/devicelease"
+	"local-csi-driver/internal/devicelease/lvbackend"
 	"local-csi-driver/internal/gc"
 	"local-csi-driver/internal/pkg/block"
 	"local-csi-driver/internal/pkg/events"
@@ -291,8 +293,17 @@ func main() {
 		logAndExit(fmt.Errorf("lvm is not supported on this node"), "lvm is not supported")
 	}
 
+	unpin, err := devicelease.PinEnrollment(ordinaryDirectory)
+	if err != nil {
+		logAndExit(err, "ordinary Block enrollment not stable")
+	}
+	defer unpin()
+	ordinary, err := devicelease.OpenOrdinary(ordinaryDirectory, nodeName, lvbackend.Backend{Manager: lvmMgr})
+	if err != nil {
+		logAndExit(err, "cannot verify ordinary Block hold journal")
+	}
 	if rawCacheRPCPort != 0 {
-		listener, err := rawCacheListener(rawCacheRPCPort, nodeName, lvmMgr)
+		listener, err := rawCacheListener(rawCacheRPCPort, nodeName, lvmMgr, ordinary)
 		if err != nil {
 			logAndExit(err, "invalid raw-cache RPC configuration")
 		}
@@ -314,6 +325,7 @@ func main() {
 		lvmMgr,
 		tp,
 		lvm.WithVolumeWipeEnabled(volumeWipeEnabled),
+		lvm.WithOrdinaryHold(ordinary),
 	)
 	if err != nil {
 		logAndExit(err, "unable to create lvm volume client")

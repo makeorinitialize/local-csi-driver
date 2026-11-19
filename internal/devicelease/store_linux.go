@@ -22,10 +22,15 @@ func Open(path string, backend Backend) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.IsDir() || info.Mode().Perm() != 0700 || int(info.Sys().(*syscall.Stat_t).Uid) != os.Geteuid() || backend == nil {
+	if !privateDirectory(info) || backend == nil {
 		return nil, errors.New("need a private provider-owned directory and backend")
 	}
+
 	return &Provider{directory: path, backend: backend}, nil
+}
+
+func privateDirectory(info os.FileInfo) bool {
+	return info.IsDir() && info.Mode().Perm() == 0700 && int(info.Sys().(*syscall.Stat_t).Uid) == os.Geteuid()
 }
 
 // Initialize is an explicit operator operation, not a Reserve recovery path.

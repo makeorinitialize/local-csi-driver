@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
+	"local-csi-driver/internal/csi/core"
 	"local-csi-driver/internal/csi/core/lvm"
 	"local-csi-driver/internal/csi/mounter"
 	"local-csi-driver/internal/pkg/events"
@@ -120,6 +121,9 @@ func (r *PVFailoverReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			"Cleaning up LVM volume %s from node %s due to node annotation mismatch", volumeID, r.nodeID)
 
 		// Unmount the volume before deletion
+		if err := core.BeforePhysical(r.lvmManager, volumeID); err != nil {
+			return ctrl.Result{}, err
+		}
 		if devicePath != "" {
 			log.V(2).Info("Unmounting volume before deletion", "devicePath", devicePath)
 			if err := r.lvmManager.UnmountVolume(ctx, devicePath); err != nil {
