@@ -221,9 +221,18 @@ func TestDynamicEnrollmentAgainstCSIHandlers(t *testing.T) {
 			if _, err := p.ReserveInPool(t.Context(), cfg.PoolUUID, "reuse", o.CompositeID, cfg.Bytes); err == nil {
 				t.Fatal("retired slot reused", err)
 			}
+			if err := unpublish(); status.Code(err) != codes.FailedPrecondition {
+				t.Fatal("node release bypassed allocation closure", err)
+			}
+			if err := p.ReleaseAllocation(t.Context(), "close", devicelease.Allocation{
+				PoolUUID: o.PoolUUID, CompositeID: o.CompositeID, LeaseID: o.LeaseID,
+				ResourceID: o.ResourceID, StableDeviceID: o.StableDeviceID, Generation: o.Generation,
+			}, o.Epoch); err != nil {
+				t.Fatal(err)
+			}
 			mount.EXPECT().CleanupMountPoint(req.TargetPath).Return(nil)
 			if err := unpublish(); err != nil {
-				t.Fatal("retirement did not permit native teardown", err)
+				t.Fatal("closure did not permit native teardown", err)
 			}
 		})
 	}

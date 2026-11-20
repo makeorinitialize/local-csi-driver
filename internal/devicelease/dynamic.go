@@ -52,7 +52,8 @@ type OrdinaryDiscoverer interface {
 }
 
 type dynamicState struct {
-	Config DynamicConfig
+	Config  DynamicConfig
+	Closure *allocationClosure `json:",omitempty"`
 	// Denied is append-only: a native command may survive process death.
 	// Pending provisions are cleared ONLY by that invocation after success.
 	Denied  map[string]bool
@@ -143,17 +144,35 @@ func (p *Provider) dynamicQuery(ctx context.Context, pool, request, composite, i
 		if pool != s.PoolUUID {
 			return ErrStale
 		}
+		if s.Dynamic.Closure != nil {
+			if id != "" {
+				r := s.Records[s.Canary.CompositeID]
+				if r.LeaseID != id {
+					return ErrUncertain
+				}
+				// Return identity only so the RPC can authorize the closed key.
+				result = r
+				return ErrNotFound
+			}
+			if request != "" {
+				return ErrHeld
+			}
+			return nil
+		}
 		if s.Canary == nil {
 			// There is no independently inspected candidate for GetCapacity.
 			if request == "" {
 				if id != "" {
-					return ErrNotFound
+					return ErrUncertain
 				}
 				return nil
 			}
 			if err := p.enroll(ctx, s, save, request, composite, n); err != nil {
 				return err
 			}
+		}
+		if id != "" && s.Records[s.Canary.CompositeID].LeaseID != id {
+			return ErrUncertain
 		}
 		if err := p.sourceCurrent(ctx, s, true); err != nil {
 			return err
@@ -271,7 +290,7 @@ func (p *Provider) dynamicPhysical(id, uuid string, target *BlockTarget) error {
 				keys = append(keys, deviceKey(target.Major, target.Minor))
 			}
 		}
-		if e := s.Canary; e != nil && !s.Retired {
+		if e := s.Canary; e != nil && d.Closure == nil {
 			match := id == "pool" || id == e.VolumeHandle || id == mapperID(e.VolumeHandle) || uuid != "" && uuid == e.LVUUID
 			if target != nil {
 				if target.DMUUID != "" {

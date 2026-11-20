@@ -74,6 +74,22 @@ func (s *service) Release(ctx context.Context, q *pb.ReleaseRequest) (*pb.Releas
 	if !current(q) || q.RequestId == "" {
 		return nil, invalid
 	}
+	if q.Mode == pb.ReleaseMode_RELEASE_MODE_ALLOCATION {
+		a := q.Allocation
+		k := a.GetKey()
+		if !current(a) || !current(k) || q.NodeId != "" || q.CleanupReceiptId != "" ||
+			k.Provider == "" || k.LeaseId == "" || a.CompositeVolumeId == "" || a.ResourceId == "" ||
+			a.StableDeviceId == "" || a.DeviceGeneration == 0 {
+			return nil, invalid
+		}
+		if err := s.db.ReleaseAllocation(ctx, q.RequestId, devicelease.Allocation{
+			PoolUUID: k.Provider, CompositeID: a.CompositeVolumeId, LeaseID: k.LeaseId,
+			ResourceID: a.ResourceId, StableDeviceID: a.StableDeviceId, Generation: a.DeviceGeneration,
+		}, q.OwnerEpoch); err != nil {
+			return nil, rpcError(err)
+		}
+		return &pb.ReleaseAck{}, nil
+	}
 	if q.Mode != pb.ReleaseMode_RELEASE_MODE_NODE {
 		return nil, blocked
 	}

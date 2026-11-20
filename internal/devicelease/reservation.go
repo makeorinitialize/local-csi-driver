@@ -118,6 +118,8 @@ func (p Provider) Capacity(ctx context.Context, poolUUID string) (int64, error) 
 
 // Lookup checks the physical inventory against the journal, including the LV
 // UUID and generation. It cannot commit a pending creation or validate IO.
+// An authoritatively closed dynamic key returns its retained identity with
+// ErrNotFound for scope authorization only, without querying source or media.
 func (p Provider) Lookup(ctx context.Context, poolUUID, leaseID string) (Reservation, error) {
 	if !validID(poolUUID) || !validID(leaseID) {
 		return Reservation{}, errors.New("pool UUID and lease ID required")
@@ -340,7 +342,7 @@ func (s *ledger) validate() error {
 		}
 		for _, r := range s.Records {
 			if r.Handle != e.VolumeHandle || r.CompositeID != e.CompositeID || r.Generation != e.Generation || r.StableDeviceID != e.LVUUID || r.CapacityBytes != e.Bytes ||
-				s.Retired != (r.Claim != nil && r.Claim.Phase == "") {
+				s.Retired != (r.Claim != nil && r.Claim.Phase == "" || s.Dynamic != nil && s.Dynamic.Closure != nil) {
 				return ErrUncertain
 			}
 		}
@@ -370,5 +372,8 @@ func (s *ledger) validate() error {
 		}
 		seen[r.LeaseID], gens[r.Generation] = true, true
 	}
-	return s.validateClaims()
+	if err := s.validateClaims(); err != nil {
+		return err
+	}
+	return s.validateClosure()
 }

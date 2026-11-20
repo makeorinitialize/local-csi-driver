@@ -127,9 +127,66 @@ uncertainty does not freeze the node's ordinary volumes.
 
 A lost successful Reserve reply replays the same lease/incarnation after restart.
 An interrupted admission retains the slot; native teardown stays denied.
-Successful independent node release allows native teardown but never a second
-enrollment of the retired LV or another LV in that slot. Disabling RPC does not
-disable the protecting gate. Downgrade to a binary without v4 support is unsafe.
+Successful independent node release retires acquisition rights, but this dynamic
+domain retains native teardown exclusion until allocation authorization closure
+below. Neither transition permits a second enrollment of the retired LV or
+another LV in that slot. Disabling RPC does not disable the protecting gate.
+Downgrade while a dynamic domain exists is unsupported.
+
+### Irreversible allocation authorization closure
+
+The existing v1 `Release` RPC supports `RELEASE_MODE_ALLOCATION` **only for
+this dynamic single-canary domain**. It closes provider use authorization; it
+does not unmount, deactivate, wipe, remove or otherwise touch an LV. The normal
+backing PVC/PV CSI lifecycle still owns all physical reclamation.
+
+The authenticated controller sends:
+
+```text
+request_id: stable unique closure operation ID
+allocation: exact tuple returned by Reserve (provider/lease/composite/resource/stable ID/generation)
+owner_epoch: 0 if never acquired, otherwise the exact verified released epoch
+mode: RELEASE_MODE_ALLOCATION
+node_id: ""
+cleanup_receipt_id: ""
+```
+
+For example, the facade uses `release-<spec.cacheParameters.requestID>-<epoch>`.
+No identifier is normalized, no caller-supplied path is resolved, and no new
+wire field or receipt format is introduced. Admission requires positive local
+journal evidence, serialized with Reserve, Acquire and native operations:
+
+- **Never acquired:** the complete reservation was durably committed,
+  enrollment is not pending, the node Claim is absent, the acquisition mutation
+  history is empty, and expected epoch is exactly zero.
+- **Verified released:** the exact node release is durably `Done`, with the
+  matching allocation and epoch, retired acquisition rights and an empty
+  released Claim. Acquired, Held, Preparing, Closing, expired, missing or
+  otherwise uncertain states are not eligible.
+
+Dynamic Acquire now journals `preparing` **before** dispatching any authority
+check or exclusive probe. Thus a crash/error before returning its receipt is
+not mistaken for "never acquired." That uncertainty retains the hold and cannot
+be automatically canceled or reacquired. TTL expiry remains a retained Held
+state, never permission to close or reclaim.
+
+Closure atomically saves the exact request, allocation and epoch as a permanent
+tombstone while retaining all existing request/generation/mutation history.
+Only after that commit may normal native delete/unpublish/GC proceed. Late
+Acquire and Reserve, including old successful request replays, cannot reopen
+the slot. Verified ReleaseNode alone no longer permits native reclamation in
+this dynamic domain; legacy offline enrollment behavior is unchanged.
+
+An exact committed Release replay is history-only and succeeds after source
+CR/PVC deletion, API outage, physical LV removal or provider restart. A changed
+request, allocation or epoch conflicts rather than replacing that history.
+For the exact recorded provider/lease key, GetLease returns **NotFound only
+after authoritative closure**, independently of live source/media availability.
+Composite authorization is still checked using the retained allocation before
+returning NotFound. Unknown keys and missing/corrupt journals are **Unavailable**,
+not evidence of successful cleanup. GetCapacity stays zero and the slot is
+never rearmed. The facade must retain its finalizers on uncertain closure;
+once both providers confirm closure, normal backing resource cleanup can run.
 
 ### Remaining host custody dependency
 
@@ -139,9 +196,11 @@ below must still exclude all unauthorized future opens, authenticate the
 actual FD holder, and prove guest cleanup **and** host hot-unplug/reopen
 exclusion before node release. ACS holds the FD through durable admission,
 not across RPCs. No receipt here substitutes for those host guarantees.
-Without that custodian, Acquire/Validate/Release remain fail-closed. A deleting
-or unavailable source also retains ownership; operator recovery must preserve
-the journal and prove host custody rather than remove finalizers or reset it.
+Without that custodian, Acquire/Validate/ReleaseNode remain fail-closed.
+Never-acquired allocation cancellation needs no live custodian because it
+closes a positively recorded, unused authorization, not a node ownership claim.
+A deleting or unavailable source never implicitly releases ownership; operator
+recovery must preserve the journal rather than remove finalizers or reset it.
 
 ### Focused validation
 
@@ -150,15 +209,17 @@ filesystem (Windows-mounted filesystems do not provide the required directory
 permissions/rename semantics). These commands passed for this integration:
 
 ```sh
-go test -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... ./internal/csi/core/lvm/... ./internal/gc/... ./cmd/driver/...
-go test -race -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... -run 'TestDynamic|TestAuthoritative|TestOrdinary|TestEnrollment|TestRPCResolve'
+go test -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... ./internal/csi/controller/... ./internal/csi/core/lvm/... ./internal/gc/... ./cmd/driver/...
+go test -race -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... -run 'TestAllocationClosure|TestDynamic|TestAuthoritative|TestOrdinary|TestEnrollment|TestRPCResolve'
 ```
 
 Tests exercise actual CSI handlers and authenticated generated RPC clients,
 with fake API inventory and mocked physical operations. They cover native
 admission before registration, both race winners, pending/crashed provisioning,
 partial enrollment, lost replies/restart, deleting-source receipt recovery,
-identity mismatches and retired-slot rejection. They are not a live-device,
+identity mismatches, uncertain acquisition, exact allocation closure, late
+Acquire/closure ordering, native DeleteVolume after closure, closed-key
+observation after source/media removal, and retired-slot rejection. They are not a live-device,
 host-custody, cloud or deployment qualification.
 
 ## Ordinary ACS Block PV canary (no allocation)
@@ -373,7 +434,10 @@ trusted custodian at `/etc/acs-dmstack-provider/custody.sock`. No custodian
 is installed by ACS. Without one, no IO handoff or cleanup can succeed.
 Only the existing, authenticated `node` role for the exact node/composite may
 acquire, validate, renew or release its node claim. The allocation remains
-charged after release. Allocation destruction/reuse is still unavailable.
+charged after release in the dedicated raw-pool and offline modes.
+The online dynamic domain additionally supports the irreversible authorization
+closure above; physical deletion is still never performed by a provider RPC,
+and allocation reuse remains unavailable in every mode.
 
 The custodian must control **all** raw access on this dedicated, non-shared
 node. Local root, arbitrary privileged pods, VG aliases/clones, externally

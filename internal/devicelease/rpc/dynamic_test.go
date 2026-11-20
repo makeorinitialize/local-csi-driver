@@ -52,13 +52,17 @@ func TestDynamicRPCReservedReceiptBeforeAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const ctl, node = "spiffe://test/controller/n1", "spiffe://test/node/n1"
+	const ctl, node, other = "spiffe://test/controller/n1", "spiffe://test/node/n1", "spiffe://test/other/n1"
 	policy := policy{Provider: cfg.PoolUUID, LocalCustody: true, Grants: []Grant{
 		{URI: ctl, NodeID: cfg.NodeName, Role: "controller", Composites: []string{"one"}},
 		{URI: node, NodeID: cfg.NodeName, Role: "node", Composites: []string{"one"}},
+		{URI: other, NodeID: cfg.NodeName, Role: "controller", Composites: []string{"other"}},
 	}}
 	clients := authenticatedClients(t, policy, db, new(enrolled))
 	controller, consumer := clients(ctl), clients(node)
+	if _, err := controller.GetLease(t.Context(), &pb.LeaseKey{Provider: cfg.PoolUUID, LeaseId: "unknown"}); status.Code(err) != codes.Unavailable {
+		t.Fatal("unknown key reported authoritative absence", err)
+	}
 	q := &pb.ReserveRequest{RequestId: "reserve", CompositeVolumeId: "one", CapacityBytes: uint64(cfg.Bytes),
 		Pool: &pb.Pool{Provider: cfg.PoolUUID, PoolId: devicelease.OrdinaryPool}}
 	if _, err := consumer.Reserve(t.Context(), q); status.Code(err) != codes.PermissionDenied {
@@ -100,5 +104,63 @@ func TestDynamicRPCReservedReceiptBeforeAttachment(t *testing.T) {
 	source.mu.Unlock()
 	if _, err := controller.GetLease(t.Context(), reserved.Allocation.Key); status.Code(err) != codes.Unavailable {
 		t.Fatal("receipt recovery adopted replaced source", err)
+	}
+	closeRequest := &pb.ReleaseRequest{RequestId: "release-reserve-0", Allocation: reserved.Allocation,
+		Mode: pb.ReleaseMode_RELEASE_MODE_ALLOCATION}
+	if _, err := consumer.Release(t.Context(), closeRequest); status.Code(err) != codes.PermissionDenied {
+		t.Fatal("node principal closed allocation", err)
+	}
+	for _, mutate := range []func(*pb.ReleaseRequest){
+		func(q *pb.ReleaseRequest) { q.OwnerEpoch = 1 },
+		func(q *pb.ReleaseRequest) { q.Allocation.DeviceGeneration++ },
+		func(q *pb.ReleaseRequest) { q.Allocation.StableDeviceId += "-changed" },
+		func(q *pb.ReleaseRequest) { q.Allocation.ResourceId = "/dev/" + q.Allocation.ResourceId },
+		func(q *pb.ReleaseRequest) { q.Allocation.Key.LeaseId += "-changed" },
+	} {
+		wrong := proto.Clone(closeRequest).(*pb.ReleaseRequest)
+		mutate(wrong)
+		if _, err := controller.Release(t.Context(), wrong); status.Code(err) != codes.Aborted {
+			t.Fatal("inexact closure accepted", wrong, err)
+		}
+	}
+	conflict := proto.Clone(closeRequest).(*pb.ReleaseRequest)
+	conflict.RequestId = "reserve"
+	if _, err := controller.Release(t.Context(), conflict); status.Code(err) != codes.AlreadyExists {
+		t.Fatal("closure overwrote Reserve request history", err)
+	}
+	if _, err := controller.Release(t.Context(), closeRequest); err != nil {
+		t.Fatal("committed never-acquired allocation could not close", err)
+	}
+	// Restart after a lost close reply. Source identity is no longer available;
+	// only the exact durable tombstone can acknowledge this key as closed.
+	reopened, err := devicelease.OpenDynamic(path, cfg, source, canaryObservation{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := authenticatedClients(t, policy, reopened, new(enrolled))
+	controller, consumer = restarted(ctl), restarted(node)
+	if _, err := controller.Release(t.Context(), closeRequest); err != nil {
+		t.Fatal("exact closure replay depended on live source", err)
+	}
+	if _, err := controller.GetLease(t.Context(), reserved.Allocation.Key); status.Code(err) != codes.NotFound {
+		t.Fatal("closed key lost authoritative absence", err)
+	}
+	if _, err := restarted(other).GetLease(t.Context(), reserved.Allocation.Key); status.Code(err) != codes.PermissionDenied {
+		t.Fatal("closed-key observation bypassed composite authorization", err)
+	}
+	if _, err := controller.GetLease(t.Context(), &pb.LeaseKey{Provider: cfg.PoolUUID, LeaseId: "unknown"}); status.Code(err) != codes.Unavailable {
+		t.Fatal("unknown key confused with closed key", err)
+	}
+	if _, err := controller.Reserve(t.Context(), q); status.Code(err) != codes.FailedPrecondition {
+		t.Fatal("late Reserve replay reopened closed authorization", err)
+	}
+	if _, err := consumer.Acquire(t.Context(), &pb.AcquireRequest{RequestId: "acquire",
+		Owner: &pb.Owner{Allocation: reserved.Allocation, NodeId: cfg.NodeName, OwnerEpoch: 1}}); status.Code(err) != codes.Aborted {
+		t.Fatal("late Acquire reopened closed authorization", err)
+	}
+	conflict = proto.Clone(closeRequest).(*pb.ReleaseRequest)
+	conflict.OwnerEpoch++
+	if _, err := controller.Release(t.Context(), conflict); status.Code(err) != codes.AlreadyExists {
+		t.Fatal("closure replay changed committed epoch", err)
 	}
 }

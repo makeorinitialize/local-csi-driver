@@ -227,6 +227,16 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 				return ErrStale
 			}
 			if s.Canary != nil {
+				if s.Dynamic != nil {
+					// Cancellation must distinguish "never acquired" from a
+					// dispatched authority/probe with an unknown outcome.
+					*c = Claim{Phase: "preparing", Node: o.NodeID, Epoch: o.Epoch, Request: id}
+					s.Records[o.CompositeID] = r
+					record()
+					if err := save(); err != nil {
+						return err
+					}
+				}
 				if err := a.Enrolled(o); err != nil {
 					return err
 				}

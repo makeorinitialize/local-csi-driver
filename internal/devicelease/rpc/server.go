@@ -73,9 +73,6 @@ func scopeOwner(ctx context.Context, req any, g Grant, provider string) error {
 	if a.GetKey().GetProvider() != provider || !permitted(ctx, a.GetCompositeVolumeId()) {
 		return denied
 	}
-	if r, ok := req.(*pb.ReleaseRequest); ok && r.Mode == pb.ReleaseMode_RELEASE_MODE_ALLOCATION {
-		return blocked
-	}
 	return nil
 }
 
@@ -126,6 +123,11 @@ func (s *service) GetLease(ctx context.Context, key *pb.LeaseKey) (*pb.Lease, er
 		return nil, denied
 	}
 	r, err := s.db.Lookup(ctx, key.Provider, key.LeaseId)
+	// A closed dynamic lease returns its durable identity with ErrNotFound.
+	// Authorize that identity before exposing authoritative closed semantics.
+	if r.CompositeID != "" && !permitted(ctx, r.CompositeID) {
+		return nil, denied
+	}
 	if err != nil {
 		return nil, rpcError(err)
 	}
