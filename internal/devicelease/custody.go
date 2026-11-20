@@ -100,11 +100,14 @@ func (o Owner) matches(r Reservation) bool {
 }
 
 func (p Provider) inventory(ctx context.Context, s *ledger, r Reservation) (Volume, error) {
-	if p.ordinary != nil {
+	if p.isOrdinary() {
 		if err := p.checkCanary(s); err != nil {
 			return Volume{}, err
 		}
-		return observe(ctx, p.observer, *p.ordinary)
+		if err := p.sourceCurrent(ctx, s, false); err != nil {
+			return Volume{}, err
+		}
+		return observe(ctx, p.observer, *s.Canary)
 	}
 	pool, err := p.backend.Inspect(ctx)
 	if err != nil {
@@ -133,7 +136,7 @@ func (p Provider) ReleaseNode(ctx context.Context, a Authority, id string, o Own
 
 func (p Provider) change(ctx context.Context, a Authority, id string, m mutation) (Reservation, error) {
 	media, ok := p.backend.(LocalMedia)
-	if (!ok && p.ordinary == nil) || a == nil || !validID(id) || !m.Owner.valid() {
+	if (!ok && !p.isOrdinary()) || a == nil || !validID(id) || !m.Owner.valid() {
 		return Reservation{}, ErrUncertain
 	}
 	o := m.Owner
@@ -142,11 +145,11 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if p.ordinary != nil {
+		if p.isOrdinary() {
 			if err := p.checkCanary(s); err != nil {
 				return err
 			}
-			if o.NodeID != p.ordinary.NodeID {
+			if o.NodeID != s.Canary.NodeID {
 				return ErrStale
 			}
 		}

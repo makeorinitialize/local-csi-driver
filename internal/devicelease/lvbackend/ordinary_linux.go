@@ -18,6 +18,23 @@ import (
 	"local-csi-driver/internal/devicelease"
 )
 
+// DiscoverOrdinary obtains the UUID from the actual LV, never from Kubernetes
+// annotations or a caller-supplied stable ID. InspectOrdinary then verifies the
+// full VG/LV/sysfs identity before the provider attempts an exclusive open.
+func (b Backend) DiscoverOrdinary(ctx context.Context, e devicelease.Enrollment) (devicelease.Enrollment, error) {
+	vg, lv, _ := strings.Cut(e.VolumeHandle, "#")
+	if !devicelease.OrdinaryTarget(vg, lv) {
+		return e, devicelease.ErrUncertain
+	}
+	l, err := b.Manager.GetLogicalVolume(ctx, vg, lv)
+	if err != nil || l == nil || !lvmID.MatchString(l.UUID) {
+		return e, errors.Join(devicelease.ErrUncertain, err)
+	}
+	e.LVUUID = l.UUID
+	_, err = b.InspectOrdinary(ctx, e)
+	return e, err
+}
+
 func (b Backend) InspectOrdinary(ctx context.Context, e devicelease.Enrollment) (devicelease.Volume, error) {
 	vg, lv, _ := strings.Cut(e.VolumeHandle, "#")
 	if !devicelease.OrdinaryTarget(vg, lv) || !lvmID.MatchString(e.VGUUID) || !lvmID.MatchString(e.LVUUID) {

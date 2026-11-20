@@ -98,14 +98,29 @@ func withUnused(b OrdinaryObserver, e Enrollment, v Volume, fn func() error) err
 // Pin the startup decision: an older running instance of this binary that
 // observed no enrollment must exit before offline enrollment can succeed.
 func PinEnrollment(path string) (func(), error) {
+	return pinEnrollment(path, false)
+}
+
+// PinDynamicEnrollment excludes older driver instances that pinned an absent
+// enrollment, as well as duplicate online providers. This is a startup-only
+// domain: never enable it behind already running CSI handlers.
+func PinDynamicEnrollment(path string) (func(), error) {
+	return pinEnrollment(path, true)
+}
+
+func pinEnrollment(path string, dynamic bool) (func(), error) {
 	parent, err := os.Open(filepath.Dir(path))
-	if errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, os.ErrNotExist) && !dynamic {
 		return func() {}, nil
 	} // non-chart installation, no canary mount
 	if err != nil {
 		return nil, err
 	}
-	if err := unix.Flock(int(parent.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
+	mode := unix.LOCK_SH
+	if dynamic {
+		mode = unix.LOCK_EX
+	}
+	if err := unix.Flock(int(parent.Fd()), mode|unix.LOCK_NB); err != nil {
 		_ = parent.Close()
 		return nil, err
 	}
@@ -126,7 +141,7 @@ func OpenOrdinary(path, node string, b OrdinaryObserver) (*Provider, error) {
 	}
 	p := &Provider{directory: path, observer: b}
 	err = withLedger(path, func(s *ledger, _ func() error) error {
-		if s.Canary == nil || s.Canary.NodeID != node {
+		if s.Dynamic != nil || s.Canary == nil || s.Canary.NodeID != node {
 			return ErrUncertain
 		}
 		p.ordinary = s.Canary
@@ -144,7 +159,7 @@ func observe(ctx context.Context, b OrdinaryObserver, e Enrollment) (Volume, err
 	return v, nil
 }
 func (p *Provider) PoolID() string {
-	if p.ordinary != nil {
+	if p.isOrdinary() {
 		return OrdinaryPool
 	}
 	return Group
@@ -157,6 +172,15 @@ func (r Reservation) ResourceID() string {
 }
 
 func (p *Provider) checkCanary(s *ledger) error {
+	if p.dynamic != nil {
+		if err := p.checkDynamic(s); err != nil {
+			return err
+		}
+		if s.Canary == nil || s.Dynamic.Admission {
+			return ErrUncertain
+		}
+		return nil
+	}
 	if s.Canary == nil || *s.Canary != *p.ordinary {
 		return ErrUncertain
 	}
@@ -167,6 +191,17 @@ func (p *Provider) ordinaryQuery(ctx context.Context, pool, request, composite, 
 	var result Reservation
 	var available int64
 	err := withLedger(p.directory, func(s *ledger, save func() error) error {
+		var err error
+		result, available, err = p.queryOrdinary(ctx, s, save, pool, request, composite, id, n)
+		return err
+	})
+	return result, available, err
+}
+
+func (p *Provider) queryOrdinary(ctx context.Context, s *ledger, save func() error, pool, request, composite, id string, n int64) (Reservation, int64, error) {
+	var result Reservation
+	var available int64
+	err := func() error {
 		if err := p.checkCanary(s); err != nil {
 			return err
 		}
@@ -247,7 +282,7 @@ func (p *Provider) ordinaryQuery(ctx context.Context, pool, request, composite, 
 		}
 		result = r
 		return nil
-	})
+	}()
 	if err != nil {
 		return Reservation{}, 0, err
 	}
@@ -258,6 +293,12 @@ func (p *Provider) ordinaryQuery(ctx context.Context, pool, request, composite, 
 // an unlocked race: retiring the one-shot enrollment precludes every future
 // resolve/acquire, even if the physical command crashes or is still running.
 func (p *Provider) BeforePhysical(id, lvUUID string) error {
+	if p != nil && p.dynamic != nil {
+		if !p.inDomain(id) && lvUUID == "" {
+			return nil
+		}
+		return p.dynamicPhysical(id, lvUUID, nil)
+	}
 	if p == nil || p.ordinary == nil {
 		return nil
 	}
@@ -283,6 +324,9 @@ func (p *Provider) BeforePhysical(id, lvUUID string) error {
 }
 
 func (p *Provider) BeforePoolRemoval() error {
+	if p != nil && p.dynamic != nil {
+		return p.dynamicPhysical("pool", "", nil)
+	}
 	if p == nil || p.ordinary == nil {
 		return nil
 	}
@@ -293,6 +337,17 @@ func (p *Provider) BeforePoolRemoval() error {
 // a bind-mounted block inode if an inconsistent handle names another volume.
 // The path is never used to enroll, resolve, open or grant access.
 func (p *Provider) BeforeUnpublish(id, path string) error {
+	if p != nil && p.dynamic != nil {
+		target, err := p.observer.BlockTarget(path)
+		if err != nil {
+			return err
+		}
+		if !p.inDomain(id) && (target == nil || target.DMUUID != "" &&
+			!strings.HasPrefix(target.DMUUID, "LVM-"+strings.ReplaceAll(p.dynamic.config.PoolUUID, "-", ""))) {
+			return nil
+		}
+		return p.dynamicPhysical(id, "", target)
+	}
 	if p == nil || p.ordinary == nil {
 		return nil
 	}

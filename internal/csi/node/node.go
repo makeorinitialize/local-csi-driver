@@ -241,6 +241,11 @@ func (ns *Server) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolume
 		return nil, status.Error(codes.InvalidArgument, "volume path was empty")
 	}
 
+	if g, ok := ns.volume.(interface{ BeforeStats(string, string) error }); ok {
+		if err := g.BeforeStats(req.GetVolumeId(), req.GetVolumePath()); err != nil {
+			return nil, err
+		}
+	}
 	exists, err := ns.mounter.PathExists(req.GetVolumePath())
 	if err != nil {
 		span.SetStatus(otcodes.Error, "failed to check if path exists")

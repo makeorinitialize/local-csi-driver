@@ -1,0 +1,31 @@
+{
+  "config": {
+    "namespace": "canary-backing",
+    "namespaceUID": "namespace-uid",
+    "nodeName": "canary-node",
+    "nodeUID": "node-uid",
+    "originStorageClass": "origin",
+    "cacheStorageClass": "cache",
+    "originBytes": 8192,
+    "cacheBytes": 4096
+  },
+  "owner": "dmstack-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.composite-uid",
+  "origin": {
+    "name": "dmstack-34ecb6e860e6fc48da388dbf12148e64807647ac-origin",
+    "uid": "origin-pvc-uid",
+    "classUID": "origin-class-uid",
+    "binding": "WaitForFirstConsumer",
+    "pvName": "origin-pv",
+    "pvUID": "origin-pv-uid",
+    "handle": "/subscriptions/test/disks/origin"
+  },
+  "cache": {
+    "name": "dmstack-34ecb6e860e6fc48da388dbf12148e64807647ac-cache",
+    "uid": "cache-pvc-uid",
+    "classUID": "cache-class-uid",
+    "binding": "WaitForFirstConsumer",
+    "pvName": "cache-pv",
+    "pvUID": "cache-pv-uid",
+    "handle": "containerstorage#pvc-12345678-1234-1234-1234-123456789abc"
+  }
+}

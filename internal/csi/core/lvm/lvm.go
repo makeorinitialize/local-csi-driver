@@ -199,6 +199,9 @@ func (l *LVM) BeforePhysical(id, uuid string) error {
 func (l *LVM) BeforeUnpublish(id, path string) error {
 	return holdError(l.ordinary.BeforeUnpublish(id, path))
 }
+func (l *LVM) BeforeStats(id, path string) error {
+	return holdError(l.ordinary.BeforeStats(id, path))
+}
 func holdError(err error) error {
 	if errors.Is(err, devicelease.ErrHeld) {
 		return status.Error(grpcCodes.FailedPrecondition, "ordinary Block volume is held")
@@ -376,6 +379,9 @@ func (l *LVM) provisionVolumeGroup(ctx context.Context, name string, devices []s
 	// immediately before CreateVolumeGroup and inside the per-volume-group
 	// singleflight, so cleanup can never race a concurrent create of the same
 	// volume group.
+	if err := l.ordinary.BeforeGroupMutation(name); err != nil {
+		return nil, holdError(err)
+	}
 	if err := l.lvm.RemoveStaleDeviceMapperNodes(ctx, name); err != nil {
 		log.Error(err, "failed to remove stale device-mapper nodes")
 		recorder.Eventf(corev1.EventTypeWarning, provisioningVolumeGroupFailed, "Failed to remove stale device-mapper nodes for volume group %s: %s", name, err)
@@ -418,6 +424,9 @@ func (l *LVM) provisionVolumeGroup(ctx context.Context, name string, devices []s
 // If all physical volumes exist or were created successfully, it returns them
 // as a list of device paths, otherwise it returns an error and an empty list.
 func (l *LVM) EnsurePhysicalVolumes(ctx context.Context, vgName string) ([]string, error) {
+	if err := l.ordinary.BeforeGroupMutation(vgName); err != nil {
+		return nil, holdError(err)
+	}
 	log := log.FromContext(ctx)
 	recorder := events.FromContext(ctx)
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/EnsurePhysicalVolumes")
@@ -510,10 +519,17 @@ func (l *LVM) ensurePhysicalVolume(ctx context.Context, device string) (*lvm.Phy
 // EnsureVolume ensures that the volume exists with the given name and size.
 // If the volume already exists, it returns it. Otherwise it creates the
 // volume and returns it.
-func (l *LVM) EnsureVolume(ctx context.Context, volumeId string, capacity int64, limit int64, isMountOperation bool) (int64, error) {
-	if err := l.BeforePhysical(volumeId, ""); err != nil {
-		return 0, err
+func (l *LVM) EnsureVolume(ctx context.Context, volumeId string, capacity int64, limit int64, isMountOperation bool) (size int64, resultErr error) {
+	if isMountOperation {
+		if err := l.BeforePhysical(volumeId, ""); err != nil {
+			return 0, err
+		}
 	}
+	finish, err := l.ordinary.BeginProvision(volumeId)
+	if err != nil {
+		return 0, holdError(err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, holdError(finish(resultErr == nil))) }()
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/EnsureVolume", trace.WithAttributes(
 		attribute.String("vol.id", volumeId),
 		attribute.Int64("vol.capacity", capacity),
@@ -715,6 +731,9 @@ func (l *LVM) prepareExistingVolume(ctx context.Context, id *volumeId, lv *lvm.L
 			// mechanism would otherwise create it: vgmknodes is synchronous,
 			// so if activation truly succeeded this closes the gap instead
 			// of narrowing it.
+			if err := l.ordinary.BeforeGroupMutation(id.VolumeGroup); err != nil {
+				return holdError(err)
+			}
 			if mkErr := l.lvm.MakeVolumeGroupDeviceNodes(ctx, lvm.MakeVGDeviceNodesOptions{
 				Name: id.VolumeGroup,
 			}); mkErr != nil {
@@ -807,9 +826,6 @@ func (l *LVM) Cleanup(ctx context.Context) error {
 		return nil
 	}
 
-	if err := l.ordinary.BeforePoolRemoval(); err != nil {
-		return err
-	}
 	for _, vg := range volumeGroup {
 		if vg.Name == devicelease.Group {
 			continue
@@ -842,6 +858,9 @@ func (l *LVM) Cleanup(ctx context.Context) error {
 
 // removeVolumeGroup removes the VG from the node.
 func (l *LVM) removeVolumeGroup(ctx context.Context, vgName string) error {
+	if err := l.ordinary.BeforeGroupRemoval(vgName); err != nil {
+		return err
+	}
 	// Check if the VG exists, if there is no VG, we get NotFound error.
 	if _, err := l.lvm.GetVolumeGroup(ctx, vgName); err != nil {
 		if errors.Is(err, lvm.ErrNotFound) {
@@ -872,6 +891,9 @@ func (l *LVM) removePhysicalVolumes(ctx context.Context, devicePaths []string) e
 	for _, pv := range listResult {
 		if pv.VGName == devicelease.Group {
 			continue
+		}
+		if err := l.ordinary.BeforeGroupRemoval(pv.VGName); err != nil {
+			return err
 		}
 		pvs[pv.Name] = struct{}{}
 	}

@@ -16,6 +16,7 @@ func TestEnrollmentPublicationBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer parent.Close()
 	final := filepath.Join(root, "enrollment")
 	injected := errors.New("incomplete staging write")
@@ -50,5 +51,27 @@ func TestEnrollmentPublicationBoundary(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(final); err != nil || len(entries) != 0 {
 		t.Fatal(entries, err)
+	}
+}
+
+func TestDynamicStartupExcludesUnguardedDriver(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-enrolled-yet")
+	old, err := PinEnrollment(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release, err := PinDynamicEnrollment(path); err == nil {
+		release()
+		t.Fatal("dynamic enrollment armed behind old driver")
+	}
+	old()
+	release, err := PinDynamicEnrollment(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if old, err := PinEnrollment(path); err == nil {
+		old()
+		t.Fatal("overlapping unguarded driver started")
 	}
 }

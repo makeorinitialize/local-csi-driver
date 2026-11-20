@@ -20,7 +20,6 @@ import (
 	"local-csi-driver/internal/csi/mounter"
 	"local-csi-driver/internal/csi/server"
 	"local-csi-driver/internal/devicelease"
-	"local-csi-driver/internal/devicelease/lvbackend"
 	"local-csi-driver/internal/gc"
 	"local-csi-driver/internal/pkg/block"
 	"local-csi-driver/internal/pkg/events"
@@ -293,12 +292,16 @@ func main() {
 		logAndExit(fmt.Errorf("lvm is not supported on this node"), "lvm is not supported")
 	}
 
-	unpin, err := devicelease.PinEnrollment(ordinaryDirectory)
+	pinEnrollment := devicelease.PinEnrollment
+	if os.Getenv("ACS_DYNAMIC_BLOCK") != "" {
+		pinEnrollment = devicelease.PinDynamicEnrollment
+	}
+	unpin, err := pinEnrollment(ordinaryDirectory)
 	if err != nil {
 		logAndExit(err, "ordinary Block enrollment not stable")
 	}
 	defer unpin()
-	ordinary, err := devicelease.OpenOrdinary(ordinaryDirectory, nodeName, lvbackend.Backend{Manager: lvmMgr})
+	ordinary, err := ordinaryProvider(nodeName, lvmMgr)
 	if err != nil {
 		logAndExit(err, "cannot verify ordinary Block hold journal")
 	}

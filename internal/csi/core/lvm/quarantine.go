@@ -139,6 +139,9 @@ func (l *LVM) Quarantine(ctx context.Context, vgName, lvName string) (string, er
 // It deliberately refuses to act on a volume that has already been renamed,
 // because that volume is committed to destruction and must not be reinstated.
 func (l *LVM) ClearQuarantineTag(ctx context.Context, vgName, lvName string) error {
+	if err := l.BeforePhysical(vgName+"#"+lvName, ""); err != nil {
+		return err
+	}
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/ClearQuarantineTag", trace.WithAttributes(
 		attribute.String("vol.group", vgName),
 		attribute.String("vol.name", lvName),

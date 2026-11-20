@@ -56,8 +56,9 @@ func (r Reservation) tags() []string {
 }
 
 type ledger struct {
-	Canary   *Enrollment `json:",omitempty"`
-	Retired  bool        `json:",omitempty"`
+	Dynamic  *dynamicState `json:",omitempty"`
+	Canary   *Enrollment   `json:",omitempty"`
+	Retired  bool          `json:",omitempty"`
 	Version  int
 	PoolUUID string
 	// No record or request key is ever removed in v1.
@@ -72,6 +73,7 @@ type reserveIntent struct {
 }
 
 type Provider struct {
+	dynamic   *dynamicProvider
 	ordinary  *Enrollment
 	observer  OrdinaryObserver
 	directory string // fixed, private node-persistent directory
@@ -83,6 +85,10 @@ func validID(s string) bool { return s != "" && utf8.ValidString(s) }
 // Capacity reports only space available for another linear reservation in
 // this provider's exact pool. Unknown inventory is not zero capacity.
 func (p Provider) Capacity(ctx context.Context, poolUUID string) (int64, error) {
+	if p.dynamic != nil {
+		_, n, err := p.dynamicQuery(ctx, poolUUID, "", "", "", 0)
+		return n, err
+	}
 	if p.ordinary != nil {
 		_, n, err := p.ordinaryQuery(ctx, poolUUID, "", "", "", 0)
 		return n, err
@@ -115,6 +121,10 @@ func (p Provider) Capacity(ctx context.Context, poolUUID string) (int64, error) 
 func (p Provider) Lookup(ctx context.Context, poolUUID, leaseID string) (Reservation, error) {
 	if !validID(poolUUID) || !validID(leaseID) {
 		return Reservation{}, errors.New("pool UUID and lease ID required")
+	}
+	if p.dynamic != nil {
+		r, _, err := p.dynamicQuery(ctx, poolUUID, "", "", leaseID, 0)
+		return r, err
 	}
 	if p.ordinary != nil {
 		r, _, err := p.ordinaryQuery(ctx, poolUUID, "", "", leaseID, 0)
@@ -168,6 +178,10 @@ func (p Provider) ReserveInPool(ctx context.Context, poolUUID, request, composit
 func (p Provider) reserve(ctx context.Context, poolUUID, request, composite string, bytes int64) (Reservation, error) {
 	if !validID(request) || !validID(composite) || bytes <= 0 {
 		return Reservation{}, errors.New("request ID, composite ID and positive byte count required")
+	}
+	if p.dynamic != nil {
+		r, _, err := p.dynamicQuery(ctx, poolUUID, request, composite, "", bytes)
+		return r, err
 	}
 	if p.ordinary != nil {
 		r, _, err := p.ordinaryQuery(ctx, poolUUID, request, composite, "", bytes)
@@ -306,9 +320,22 @@ func matchTags(got, want []string) bool {
 }
 
 func (s *ledger) validate() error {
+	if d := s.Dynamic; d != nil {
+		if s.Version != 4 || !d.Config.valid() || s.PoolUUID != d.Config.PoolUUID || d.Denied == nil || d.Pending == nil ||
+			(s.Canary == nil) != (d.Source == nil) || s.Canary == nil && (d.Admission || len(s.Records) != 0 || s.Retired) {
+			return ErrUncertain
+		}
+		if s.Canary != nil && (d.Source.CompositeID != s.Canary.CompositeID || d.Source.VolumeHandle != s.Canary.VolumeHandle ||
+			d.Source.CompositeUID == "" || d.Source.Fingerprint == "" || d.Source.RequestID == "" || s.Canary.NodeID != d.Config.NodeName ||
+			s.Canary.Bytes != d.Config.Bytes || d.Admission != (len(s.Records) == 0)) {
+			return ErrUncertain
+		}
+	} else if s.Version == 4 {
+		return ErrUncertain
+	}
 	if s.Canary != nil {
 		e := s.Canary
-		if s.Version != 3 || !e.valid() || e.VGUUID != s.PoolUUID || len(s.Records) > 1 {
+		if (s.Version != 3 && s.Version != 4) || !e.valid() || e.VGUUID != s.PoolUUID || len(s.Records) > 1 {
 			return ErrUncertain
 		}
 		for _, r := range s.Records {
@@ -317,7 +344,7 @@ func (s *ledger) validate() error {
 				return ErrUncertain
 			}
 		}
-	} else if (s.Version != 1 && s.Version != 2) || (s.Version == 2) != (len(s.Mutations) > 0) || s.Retired {
+	} else if s.Dynamic == nil && ((s.Version != 1 && s.Version != 2) || (s.Version == 2) != (len(s.Mutations) > 0) || s.Retired) {
 		return ErrUncertain
 	}
 	if s.Records == nil || s.Requests == nil || s.PoolUUID == "" {
