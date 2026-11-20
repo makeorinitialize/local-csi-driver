@@ -379,5 +379,8 @@ func (s *ledger) validate() error {
 	if err := s.validateClosure(); err != nil {
 		return err
 	}
-	return s.validateHost()
+	if err := s.validateHost(); err != nil {
+		return err
+	}
+	return s.validateSourceSnapshot()
 }

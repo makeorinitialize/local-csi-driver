@@ -201,8 +201,8 @@ func TestDynamicEnrollmentAgainstCSIHandlers(t *testing.T) {
 				t.Fatal("unrelated pool frozen", err)
 			}
 			reader.err = errors.New("source API unavailable or deleted")
-			if _, err := p.Lookup(t.Context(), cfg.PoolUUID, r.LeaseID); err == nil {
-				t.Fatal("issued lease against lost source")
+			if got, err := p.Lookup(t.Context(), cfg.PoolUUID, r.LeaseID); err != nil || got.LeaseID != r.LeaseID {
+				t.Fatal("source API loss erased committed hold identity", got, err)
 			}
 			if err := unpublish(); status.Code(err) != codes.FailedPrecondition {
 				t.Fatal("source loss released hold", err)

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "owner": "dmstack-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.composite-uid",
+  "config": {
+    "namespace": "canary-backing",
+    "namespaceUID": "namespace-uid",
+    "nodeName": "canary-node",
+    "nodeUID": "node-uid"
+  },
+  "outer": {"name": "application", "uid": "outer-uid"},
+  "origin": {
+    "name": "existing-origin",
+    "uid": "origin-pvc-uid",
+    "pvName": "origin-pv",
+    "pvUID": "origin-pv-uid",
+    "className": "origin",
+    "classUID": "origin-class-uid",
+    "driver": "disk.csi.azure.com",
+    "handle": "/subscriptions/test/disks/origin",
+    "bytes": 8192
+  },
+  "cache": {
+    "name": "existing-cache",
+    "uid": "cache-pvc-uid",
+    "pvName": "cache-pv",
+    "pvUID": "cache-pv-uid",
+    "className": "cache",
+    "classUID": "cache-class-uid",
+    "driver": "localdisk.csi.acstor.io",
+    "handle": "containerstorage#pvc-12345678-1234-1234-1234-123456789abc",
+    "bytes": 4096
+  }
+}

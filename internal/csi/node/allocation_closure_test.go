@@ -182,6 +182,12 @@ func TestAllocationClosureOrdersActualCSIReclaim(t *testing.T) {
 			if _, err := reserve(); err == nil {
 				t.Fatal("old Reserve replay reopened the slot")
 			}
+			manager.EXPECT().GetLogicalVolume(gomock.Any(), cfg.VolumeGroup, "pvc-12345678-1234-1234-1234-123456789abc").
+				Return(&lvmMgr.LogicalVolume{VGName: cfg.VolumeGroup, Name: "pvc-12345678-1234-1234-1234-123456789abc", Size: 4096}, nil)
+			manager.EXPECT().IsLogicalVolumeCorrupted(gomock.Any(), cfg.VolumeGroup, gomock.Any()).Return(false, nil)
+			if _, err := core.EnsureVolume(t.Context(), deleteRequest.VolumeId, cfg.Bytes, cfg.Bytes, true); err != nil {
+				t.Fatal("ordinary source lifecycle remained held after composite closure", err)
+			}
 			// Only the real native CSI handler invokes cleanup and lvremove.
 			manager.EXPECT().RemoveLogicalVolume(gomock.Any(), lvmMgr.RemoveLVOptions{Name: a.ResourceID}).Return(nil)
 			if scenario == "close-wins" {

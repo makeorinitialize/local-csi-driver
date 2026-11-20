@@ -23,15 +23,15 @@ func TestBackingDriverDefaultsPreserveOldFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := cr.GetAnnotations()[BackingJournalKey]
-	j, err := parseBacking(cr)
+	before := cr.GetAnnotations()[ExternalSourceKey]
+	j, err := parseExternal(cr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	j.Config.OriginDriver, j.Config.CacheDriver = OfficialOriginDriver, OfficialCacheDriver
 	data, _ := json.Marshal(j)
 	annotations := cr.GetAnnotations()
-	annotations[BackingJournalKey] = string(data)
+	annotations[ExternalSourceKey] = string(data)
 	cr.SetAnnotations(annotations)
 	source.Reader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 	explicit := source.Config
@@ -41,7 +41,7 @@ func TestBackingDriverDefaultsPreserveOldFingerprint(t *testing.T) {
 	}
 	source.Config = explicit
 	now, err := source.Resolve(t.Context(), cr.GetName(), source.Config.Bytes)
-	if err != nil || now != old || before == string(data) || cr.GetAnnotations()[BackingJournalKey] != string(data) {
+	if err != nil || now != old || before == string(data) || cr.GetAnnotations()[ExternalSourceKey] != string(data) {
 		t.Fatal("explicit defaults changed identity or rewrote annotation", now, old, err)
 	}
 }
@@ -51,11 +51,12 @@ func TestBackingCustomDriversAreExactPins(t *testing.T) {
 		for _, bad := range []string{"", "official-pv", "foreign-class", "cross-role", "uppercase"} {
 			t.Run(suffix+"/"+bad, func(t *testing.T) {
 				source, cr, objects := sourceFixture(t)
-				j, err := parseBacking(cr)
+				j, err := parseExternal(cr)
 				if err != nil {
 					t.Fatal(err)
 				}
 				j.Config.OriginDriver, j.Config.CacheDriver = "disk."+suffix, "localdisk."+suffix
+				j.Origin.Driver, j.Cache.Driver = j.Config.OriginDriver, j.Config.CacheDriver
 				source.Config.OriginDriver, source.Config.CacheDriver = j.Config.OriginDriver, j.Config.CacheDriver
 				objects[3].(*storagev1.StorageClass).Provisioner = j.Config.OriginDriver
 				objects[5].(*corev1.PersistentVolume).Spec.CSI.Driver = j.Config.OriginDriver
@@ -68,6 +69,7 @@ func TestBackingCustomDriversAreExactPins(t *testing.T) {
 					objects[6].(*storagev1.StorageClass).Provisioner = "foreign.example"
 				case "cross-role":
 					j.Config.CacheDriver, source.Config.CacheDriver = OfficialOriginDriver, OfficialOriginDriver
+					j.Cache.Driver = OfficialOriginDriver
 					objects[6].(*storagev1.StorageClass).Provisioner = OfficialOriginDriver
 					objects[8].(*corev1.PersistentVolume).Spec.CSI.Driver = OfficialOriginDriver
 				case "uppercase":
@@ -75,7 +77,7 @@ func TestBackingCustomDriversAreExactPins(t *testing.T) {
 				}
 				raw, _ := json.Marshal(j)
 				annotations := cr.GetAnnotations()
-				annotations[BackingJournalKey] = string(raw)
+				annotations[ExternalSourceKey] = string(raw)
 				cr.SetAnnotations(annotations)
 				scheme := runtime.NewScheme()
 				_ = corev1.AddToScheme(scheme)

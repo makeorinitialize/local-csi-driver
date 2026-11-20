@@ -4,6 +4,7 @@
 package devicelease
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -20,84 +21,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func TestCommittedSourceCordonDeletionTeardown(t *testing.T) {
-	for _, staleSource := range []bool{false, true} {
-		t.Run(map[bool]string{false: "exact-prior-source", true: "replacement-node"}[staleSource], func(t *testing.T) {
-			p, source, k, _, composite := sourceProviderFixture(t)
-			r, err := p.ReserveInPool(t.Context(), source.Config.PoolUUID, "reserve", composite, source.Config.Bytes)
-			if err != nil {
-				t.Fatal(err)
-			}
-			o := Owner{PoolUUID: r.PoolUUID, CompositeID: r.CompositeID, LeaseID: r.LeaseID,
-				ResourceID: r.ResourceID(), StableDeviceID: r.StableDeviceID, Generation: r.Generation,
-				NodeID: source.Config.NodeName, Epoch: 1}
-			authority := proof{owner: o}
-			if _, err := p.Acquire(t.Context(), authority, "acquire", o, 0); err != nil {
-				t.Fatal(err)
-			}
-			var node corev1.Node
-			if err := k.Get(t.Context(), client.ObjectKey{Name: o.NodeID}, &node); err != nil {
-				t.Fatal(err)
-			}
-			node.Spec.Unschedulable = true
-			if staleSource {
-				node.UID = "replacement-node-uid"
-			}
-			if err := k.Update(t.Context(), &node); err != nil {
-				t.Fatal(err)
-			}
-			cr := &unstructured.Unstructured{}
-			cr.SetAPIVersion("storage.infinitydb.io/v1alpha1")
-			cr.SetKind("CompositeVolume")
-			if err := k.Get(t.Context(), client.ObjectKey{Name: composite}, cr); err != nil {
-				t.Fatal(err)
-			}
-			if err := k.Delete(t.Context(), cr); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := source.Resolve(t.Context(), composite, r.CapacityBytes); err == nil {
-				t.Fatal("new admission tolerated deletion/cordon")
-			}
-			if _, err := p.Renew(t.Context(), authority, "renew", o); err == nil {
-				t.Fatal("renew admitted on deleting source")
-			}
-			if _, err := p.Acquire(t.Context(), authority, "acquire", o, 0); err == nil {
-				t.Fatal("acquire replay admitted on deleting source")
-			}
-			if err := p.ValidateOpen(t.Context(), proof{owner: o, open: true}, o, uint64(r.CapacityBytes), 253, 9); err == nil {
-				t.Fatal("validation admitted on deleting source")
-			}
-			if staleSource {
-				if err := p.ReleaseNode(t.Context(), authority, "release", o, "receipt"); err == nil {
-					t.Fatal("teardown accepted replaced source UID")
-				}
-				if err := p.BeforePhysical(r.Handle, ""); !errors.Is(err, ErrHeld) {
-					t.Fatal("failed teardown dropped hold", err)
-				}
-				return
-			}
-			if _, err := p.Lookup(t.Context(), r.PoolUUID, r.LeaseID); err != nil {
-				t.Fatal("cordon/deletion blocked committed receipt", err)
-			}
-			stale := o
-			stale.Epoch++
-			if err := p.ReleaseNode(t.Context(), authority, "stale", stale, "receipt"); !errors.Is(err, ErrStale) {
-				t.Fatal("teardown accepted stale owner", err)
-			}
-			if err := p.ReleaseNode(t.Context(), authority, "release", o, "receipt"); err != nil {
-				t.Fatal("exact independently verified teardown was blocked", err)
-			}
-			if err := p.ReleaseAllocation(t.Context(), "close", Allocation{PoolUUID: r.PoolUUID, CompositeID: r.CompositeID,
-				LeaseID: r.LeaseID, ResourceID: r.ResourceID(), StableDeviceID: r.StableDeviceID, Generation: r.Generation}, o.Epoch); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
 func sourceFixture(t *testing.T) (KubernetesSource, *unstructured.Unstructured, []client.Object) {
 	t.Helper()
-	raw, err := os.ReadFile("testdata/backing-pvcs-v1.json")
+	raw, err := os.ReadFile("testdata/external-source-pvcs-v1.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,14 +31,14 @@ func sourceFixture(t *testing.T) (KubernetesSource, *unstructured.Unstructured, 
 		"apiVersion": "storage.infinitydb.io/v1alpha1", "kind": "CompositeVolume",
 		"spec": map[string]any{"capacity": int64(8192), "cacheBytes": int64(4096),
 			"cacheParameters": map[string]any{"provider": "vg-uuid", "poolID": OrdinaryPool, "requestID": "reserve"},
-			"topology":        map[string]any{backingPrefix + "node": "canary-node"}},
+			"topology":        map[string]any{sourcePrefix + "node": "canary-node"}},
 	}}
 	v.SetName("dmstack-" + strings.Repeat("a", 52))
 	v.SetUID("composite-uid")
 	v.SetResourceVersion("1")
-	v.SetFinalizers([]string{backingFinalizer})
-	v.SetAnnotations(map[string]string{BackingJournalKey: string(raw), backingPrefix + "selected-node": "canary-node"})
-	j, err := parseBacking(v)
+	v.SetFinalizers([]string{sourcePrefix + "allocations"})
+	v.SetAnnotations(map[string]string{ExternalSourceKey: string(raw), sourcePrefix + "selected-node": "canary-node"})
+	j, err := parseExternal(v)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,54 +47,57 @@ func sourceFixture(t *testing.T) (KubernetesSource, *unstructured.Unstructured, 
 		VolumeGroup: "containerstorage", PoolUUID: "vg-uuid", Bytes: 4096}
 	objects := []client.Object{v,
 		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: cfg.NodeName, UID: types.UID(cfg.NodeUID)}},
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cfg.Namespace, UID: types.UID(cfg.NamespaceUID),
-			Labels: map[string]string{backingPrefix + "backing-namespace": "v1"}}}}
-	for _, s := range []struct {
-		role, driver string
-		n            int64
-		pin          backingClaim
-	}{{"origin", "disk.csi.azure.com", 8192, j.Origin}, {"cache", "localdisk.csi.acstor.io", 4096, j.Cache}} {
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: cfg.Namespace, UID: types.UID(cfg.NamespaceUID)}}}
+	for _, pin := range []externalClaim{j.Origin, j.Cache} {
 		mode := corev1.PersistentVolumeBlock
 		binding := storagev1.VolumeBindingWaitForFirstConsumer
-		q := *resource.NewQuantity(s.n, resource.BinarySI)
-		annotations := map[string]string{backingPrefix + "composite-handle": j.Owner, backingPrefix + "backing-role": s.role,
-			"volume.kubernetes.io/selected-node": cfg.NodeName, "localdisk.csi.acstor.io/accept-ephemeral-storage": "true"}
+		q := *resource.NewQuantity(pin.Bytes, resource.BinarySI)
 		objects = append(objects,
-			&storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: s.role, UID: types.UID(s.pin.ClassUID)},
-				Provisioner: s.driver, VolumeBindingMode: &binding},
-			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: s.pin.Name, Namespace: cfg.Namespace,
-				UID: types.UID(s.pin.UID), Annotations: annotations, Finalizers: []string{backingFinalizer}},
-				Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: &s.role, VolumeName: s.pin.PVName, VolumeMode: &mode,
+			&storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: pin.ClassName, UID: types.UID(pin.ClassUID)},
+				Provisioner: pin.Driver, VolumeBindingMode: &binding},
+			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: pin.Name, Namespace: cfg.Namespace, UID: types.UID(pin.UID)},
+				Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: &pin.ClassName, VolumeName: pin.PVName, VolumeMode: &mode,
 					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 					Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: q}}},
 				Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound, Capacity: corev1.ResourceList{corev1.ResourceStorage: q}}},
-			&corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: s.pin.PVName, UID: types.UID(s.pin.PVUID)},
-				Spec: corev1.PersistentVolumeSpec{StorageClassName: s.role, VolumeMode: &mode,
+			&corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: pin.PVName, UID: types.UID(pin.PVUID)},
+				Spec: corev1.PersistentVolumeSpec{StorageClassName: pin.ClassName, VolumeMode: &mode,
 					AccessModes:            []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 					Capacity:               corev1.ResourceList{corev1.ResourceStorage: q},
-					ClaimRef:               &corev1.ObjectReference{Name: s.pin.Name, Namespace: cfg.Namespace, UID: types.UID(s.pin.UID)},
-					PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{Driver: s.driver, VolumeHandle: s.pin.Handle}},
+					ClaimRef:               &corev1.ObjectReference{Name: pin.Name, Namespace: cfg.Namespace, UID: types.UID(pin.UID)},
+					PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{Driver: pin.Driver, VolumeHandle: pin.Handle}},
 					NodeAffinity: &corev1.VolumeNodeAffinity{Required: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
 						{MatchFields: []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{cfg.NodeName}}}},
 					}}}},
 				Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound}},
 		)
 	}
+	fs := corev1.PersistentVolumeFilesystem
+	objects = append(objects, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: j.Outer.Name, Namespace: cfg.Namespace, UID: types.UID(j.Outer.UID),
+		Annotations: map[string]string{sourcePrefix + "origin-pvc": j.Origin.Name, sourcePrefix + "cache-pvc": j.Cache.Name}},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeMode: &fs, AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{
+				corev1.ResourceStorage: *resource.NewQuantity(j.Origin.Bytes, resource.BinarySI)}}}})
 	return KubernetesSource{Config: cfg}, v, objects
 }
 
-func TestAuthoritativeBackingJournalCompatibility(t *testing.T) {
-	tests := []struct {
+func TestAuthoritativeExternalSourceCompatibility(t *testing.T) {
+	for _, tc := range []struct {
 		name   string
 		mutate func(*unstructured.Unstructured, []client.Object)
 	}{
-		{"compatible-v1", nil},
+		{"external-names-no-ownership-markers", nil},
 		{"node-incarnation", func(_ *unstructured.Unstructured, o []client.Object) { o[1].SetUID("replacement") }},
 		{"namespace-incarnation", func(_ *unstructured.Unstructured, o []client.Object) { o[2].SetUID("replacement") }},
 		{"class-incarnation", func(_ *unstructured.Unstructured, o []client.Object) { o[6].SetUID("replacement") }},
 		{"pvc-incarnation", func(_ *unstructured.Unstructured, o []client.Object) { o[7].SetUID("replacement") }},
 		{"pv-incarnation", func(_ *unstructured.Unstructured, o []client.Object) { o[8].SetUID("replacement") }},
 		{"origin-incarnation", func(_ *unstructured.Unstructured, o []client.Object) { o[5].SetUID("replacement") }},
+		{"outer-incarnation", func(_ *unstructured.Unstructured, o []client.Object) { o[9].SetUID("replacement") }},
+		{"outer-reference-drift", func(_ *unstructured.Unstructured, o []client.Object) {
+			o[9].(*corev1.PersistentVolumeClaim).Annotations[sourcePrefix+"cache-pvc"] = "other"
+		}},
 		{"handle", func(_ *unstructured.Unstructured, o []client.Object) {
 			o[8].(*corev1.PersistentVolume).Spec.CSI.VolumeHandle += "-changed"
 		}},
@@ -180,19 +109,41 @@ func TestAuthoritativeBackingJournalCompatibility(t *testing.T) {
 			v.SetDeletionTimestamp(&now)
 		}},
 		{"cr-incarnation", func(v *unstructured.Unstructured, _ []client.Object) { v.SetUID("replacement") }},
-		{"missing-finalizer", func(v *unstructured.Unstructured, _ []client.Object) { v.SetFinalizers(nil) }},
 		{"unknown-version", func(v *unstructured.Unstructured, _ []client.Object) {
 			a := v.GetAnnotations()
-			a[backingPrefix+"backing-pvcs-v2"] = a[BackingJournalKey]
+			a[ExternalSourceKey] = strings.Replace(a[ExternalSourceKey], `"version": 1`, `"version": 2`, 1)
 			v.SetAnnotations(a)
 		}},
-		{"unknown-field", func(v *unstructured.Unstructured, _ []client.Object) {
+		{"legacy-owned-object", func(v *unstructured.Unstructured, _ []client.Object) {
 			a := v.GetAnnotations()
-			a[BackingJournalKey] = strings.Replace(a[BackingJournalKey], `"owner":`, `"version":2,"owner":`, 1)
+			a[sourcePrefix+"backing-pvcs-v1"] = "{}"
 			v.SetAnnotations(a)
 		}},
-	}
-	for _, tc := range tests {
+		{"incomplete-owner", func(v *unstructured.Unstructured, _ []client.Object) {
+			j, _ := parseExternal(v)
+			j.Owner = ""
+			b, _ := json.Marshal(j)
+			a := v.GetAnnotations()
+			a[ExternalSourceKey] = string(b)
+			v.SetAnnotations(a)
+		}},
+		{"self-source", func(v *unstructured.Unstructured, _ []client.Object) {
+			j, _ := parseExternal(v)
+			j.Cache.Name = j.Outer.Name
+			b, _ := json.Marshal(j)
+			a := v.GetAnnotations()
+			a[ExternalSourceKey] = string(b)
+			v.SetAnnotations(a)
+		}},
+		{"namespace-expansion", func(v *unstructured.Unstructured, _ []client.Object) {
+			j, _ := parseExternal(v)
+			j.Cache.Name = "other/existing-cache"
+			b, _ := json.Marshal(j)
+			a := v.GetAnnotations()
+			a[ExternalSourceKey] = string(b)
+			v.SetAnnotations(a)
+		}},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			k, v, objects := sourceFixture(t)
 			if tc.mutate != nil {
@@ -202,32 +153,154 @@ func TestAuthoritativeBackingJournalCompatibility(t *testing.T) {
 			_ = corev1.AddToScheme(s)
 			_ = storagev1.AddToScheme(s)
 			k.Reader = fake.NewClientBuilder().WithScheme(s).WithObjects(objects...).Build()
-			c, err := k.Resolve(t.Context(), v.GetName(), k.Config.Bytes)
-			if tc.mutate == nil {
-				if err != nil || c.CompositeUID != "composite-uid" || c.Fingerprint == "" {
-					t.Fatal(c, err)
+			got, err := k.Resolve(t.Context(), v.GetName(), k.Config.Bytes)
+			if tc.mutate != nil {
+				if err == nil {
+					t.Fatal("invalid source admitted", got)
 				}
-				pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "consumer", Namespace: k.Config.Namespace},
-					Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "cache", VolumeSource: corev1.VolumeSource{
-						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: objects[7].GetName()}}}}}}
-				if err := k.Reader.(client.Client).Create(t.Context(), pod); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := k.Resolve(t.Context(), v.GetName(), k.Config.Bytes); err == nil {
-					t.Fatal("consumer admitted")
-				}
-			} else if err == nil {
-				t.Fatal("invalid source admitted", c)
+				return
 			}
-			if tc.name == "deleting" {
-				if _, err := k.ResolveCommitted(t.Context(), v.GetName(), k.Config.Bytes); err != nil {
-					t.Fatal("same deleting CR cannot recover committed receipt", err)
-				}
-			} else if tc.mutate != nil {
-				if _, err := k.ResolveCommitted(t.Context(), v.GetName(), k.Config.Bytes); err == nil {
-					t.Fatal("receipt recovery bypassed source identity")
-				}
+			if err != nil || got.Snapshot == "" || got.CompositeUID != "composite-uid" {
+				t.Fatal(got, err)
+			}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "consumer", Namespace: k.Config.Namespace},
+				Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "cache", VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: objects[7].GetName()}}}}}}
+			if err := k.Reader.(client.Client).Create(t.Context(), pod); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := k.Resolve(t.Context(), v.GetName(), k.Config.Bytes); err == nil {
+				t.Fatal("source consumer admitted")
 			}
 		})
+	}
+}
+
+func TestRetainedExternalSourceSurvivesAPIDeletion(t *testing.T) {
+	p, source, k, media, composite := sourceProviderFixture(t)
+	r, err := p.ReserveInPool(t.Context(), source.Config.PoolUUID, "reserve", composite, source.Config.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := Owner{PoolUUID: r.PoolUUID, CompositeID: r.CompositeID, LeaseID: r.LeaseID,
+		ResourceID: r.ResourceID(), StableDeviceID: r.StableDeviceID, Generation: r.Generation,
+		NodeID: source.Config.NodeName, Epoch: 1}
+	authority := proof{owner: o}
+	if _, err := p.Acquire(t.Context(), authority, "acquire", o, 0); err != nil {
+		t.Fatal(err)
+	}
+	// No finalizers or deletion calls are added to externally owned sources.
+	var claims corev1.PersistentVolumeClaimList
+	if err := k.List(t.Context(), &claims, client.InNamespace(source.Config.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	for i := range claims.Items {
+		if len(claims.Items[i].Finalizers) != 0 {
+			t.Fatal("provider took source metadata ownership")
+		}
+		if err := k.Delete(t.Context(), &claims.Items[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cr := &unstructured.Unstructured{}
+	cr.SetAPIVersion("storage.infinitydb.io/v1alpha1")
+	cr.SetKind("CompositeVolume")
+	if err := k.Get(t.Context(), client.ObjectKey{Name: composite}, cr); err != nil {
+		t.Fatal(err)
+	}
+	cr.SetFinalizers(nil)
+	if err := k.Update(t.Context(), cr); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.Delete(t.Context(), cr); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := OpenDynamic(p.directory, source.Config, source, media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.Lookup(t.Context(), r.PoolUUID, r.LeaseID); err != nil {
+		t.Fatal("API deletion erased an existing hold", err)
+	}
+	if _, err := restarted.Renew(t.Context(), authority, "renew", o); err == nil {
+		t.Fatal("fresh data admission without sources")
+	}
+	if _, err := restarted.Acquire(t.Context(), authority, "acquire", o, 0); err == nil {
+		t.Fatal("Acquire replay admitted new data use without live source pins")
+	}
+	if err := restarted.ValidateOpen(t.Context(), proof{owner: o, open: true}, o, uint64(r.CapacityBytes), 253, 9); err == nil {
+		t.Fatal("Validate admitted data use without live source pins")
+	}
+	media.wrongIdentity.Store(true)
+	if _, err := restarted.Lookup(t.Context(), r.PoolUUID, r.LeaseID); !errors.Is(err, ErrUncertain) {
+		t.Fatal("retained metadata substituted for actual physical identity", err)
+	}
+	if err := restarted.ReleaseNode(t.Context(), authority, "release", o, "receipt"); !errors.Is(err, ErrUncertain) {
+		t.Fatal("cleanup accepted a different LV", err)
+	}
+	media.wrongIdentity.Store(false)
+	stale := o
+	stale.Epoch++
+	if err := restarted.ReleaseNode(t.Context(), authority, "stale", stale, "receipt"); !errors.Is(err, ErrStale) {
+		t.Fatal("stale owner used retained source", err)
+	}
+	if err := restarted.ReleaseNode(t.Context(), authority, "release", o, "unverified"); !errors.Is(err, ErrHeld) {
+		t.Fatal("API absence substituted for cleanup proof", err)
+	}
+	if err := restarted.BeforePhysical(r.Handle, ""); !errors.Is(err, ErrHeld) {
+		t.Fatal("API absence released native exclusion", err)
+	}
+	if err := restarted.ReleaseNode(t.Context(), authority, "release", o, "receipt"); err != nil {
+		t.Fatal("same-owner positive cleanup depended on API existence", err)
+	}
+	if _, err := restarted.Acquire(t.Context(), proof{owner: stale}, "higher-epoch", stale, o.Epoch); !errors.Is(err, ErrStale) {
+		t.Fatal("single-use limitation silently became epoch reuse", err)
+	}
+	if err := restarted.BeforePhysical(r.Handle, ""); !errors.Is(err, ErrHeld) {
+		t.Fatal("node-use release substituted for allocation closure", err)
+	}
+	if err := restarted.ReleaseAllocation(t.Context(), "close", Allocation{PoolUUID: r.PoolUUID, CompositeID: r.CompositeID,
+		LeaseID: r.LeaseID, ResourceID: r.ResourceID(), StableDeviceID: r.StableDeviceID, Generation: r.Generation}, o.Epoch); err != nil {
+		t.Fatal(err)
+	}
+	finish, err := restarted.BeginProvision(r.Handle)
+	if err != nil {
+		t.Fatal("closed composite retained a hold over ordinary source lifecycle", err)
+	}
+	if err := finish(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.ReserveInPool(t.Context(), r.PoolUUID, "reserve", composite, r.CapacityBytes); !errors.Is(err, ErrHeld) {
+		t.Fatal("native source release rearmed provider slot", err)
+	}
+
+}
+
+func TestExternalSourcesRemainAfterAllocationClosure(t *testing.T) {
+	p, source, k, _, composite := sourceProviderFixture(t)
+	r, err := p.ReserveInPool(t.Context(), source.Config.PoolUUID, "reserve", composite, source.Config.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ReleaseAllocation(t.Context(), "close-unused", Allocation{
+		PoolUUID: r.PoolUUID, CompositeID: r.CompositeID, LeaseID: r.LeaseID,
+		ResourceID: r.ResourceID(), StableDeviceID: r.StableDeviceID, Generation: r.Generation}, 0); err != nil {
+		t.Fatal(err)
+	}
+	var pvcs corev1.PersistentVolumeClaimList
+	var pvs corev1.PersistentVolumeList
+	if err := k.List(t.Context(), &pvcs, client.InNamespace(source.Config.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.List(t.Context(), &pvs); err != nil {
+		t.Fatal(err)
+	}
+	if len(pvcs.Items) != 3 || len(pvs.Items) != 2 {
+		t.Fatal("closure changed externally owned resources", len(pvcs.Items), len(pvs.Items))
+	}
+	for _, pvc := range pvcs.Items {
+		if pvc.DeletionTimestamp != nil || len(pvc.Finalizers) != 0 {
+			t.Fatal("provider changed source/outer ownership", pvc.Name)
+		}
 	}
 }

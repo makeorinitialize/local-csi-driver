@@ -30,9 +30,10 @@ import (
 // Regular-file media only: real SCM_RIGHTS/OFD/kernel tests never open a host
 // block device. Production selection/verification is lvbackend.Backend.
 type hostFixtureMedia struct {
-	path  string
-	stat  unix.Stat_t
-	opens atomic.Int32
+	path          string
+	stat          unix.Stat_t
+	opens         atomic.Int32
+	wrongIdentity atomic.Bool
 }
 
 func (m *hostFixtureMedia) count() int {
@@ -56,7 +57,11 @@ func (*hostFixtureMedia) DiscoverOrdinary(_ context.Context, e Enrollment) (Enro
 }
 func (m *hostFixtureMedia) InspectOrdinary(_ context.Context, e Enrollment) (Volume, error) {
 	_, name, _ := strings.Cut(e.VolumeHandle, "#")
-	return Volume{Name: name, UUID: e.LVUUID, Bytes: e.Bytes, Active: true, Open: m.count() != 0, Major: 253, Minor: 9}, nil
+	id := e.LVUUID
+	if m.wrongIdentity.Load() {
+		id = "different-lv"
+	}
+	return Volume{Name: name, UUID: id, Bytes: e.Bytes, Active: true, Open: m.count() != 0, Major: 253, Minor: 9}, nil
 }
 func (m *hostFixtureMedia) WithExclusive(_ Enrollment, _ Volume, fn func() error) error {
 	if m.count() != 0 {

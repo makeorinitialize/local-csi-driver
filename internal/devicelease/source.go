@@ -18,87 +18,124 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
-	backingPrefix     = "dmstack.csi.infinitydb.io/"
-	BackingJournalKey = backingPrefix + "backing-pvcs-v1"
-	backingFinalizer  = backingPrefix + "backing-pvcs"
+	sourcePrefix      = "dmstack.csi.infinitydb.io/"
+	ExternalSourceKey = sourcePrefix + "external-source-pvcs-v1"
 )
 
 var compositeName = regexp.MustCompile(`^dmstack-[a-z2-7]{52}$`)
 
-// These JSON tags are the public backing-pvcs-v1 annotation contract, not
-// guesses at the facade Go field names. In particular capacity is NOT the
-// journal's originBytes. No dependency on the private facade repository.
-type backingConfig struct {
-	Namespace          string `json:"namespace"`
-	NamespaceUID       string `json:"namespaceUID"`
-	NodeName           string `json:"nodeName"`
-	NodeUID            string `json:"nodeUID"`
-	OriginStorageClass string `json:"originStorageClass"`
-	CacheStorageClass  string `json:"cacheStorageClass"`
-	OriginBytes        int64  `json:"originBytes"`
-	CacheBytes         int64  `json:"cacheBytes"`
-	OriginDriver       string `json:"originDriver,omitempty"`
-	CacheDriver        string `json:"cacheDriver,omitempty"`
+// Field order/tags are the pinned external-source-pvcs-v1 contract. Sources
+// belong to the user; none of these records confers creation/deletion rights.
+type externalConfig struct {
+	Namespace    string `json:"namespace"`
+	NamespaceUID string `json:"namespaceUID"`
+	NodeName     string `json:"nodeName"`
+	NodeUID      string `json:"nodeUID"`
+	OriginDriver string `json:"originDriver,omitempty"`
+	CacheDriver  string `json:"cacheDriver,omitempty"`
 }
-type backingClaim struct {
-	Name     string                      `json:"name"`
-	UID      string                      `json:"uid,omitempty"`
-	ClassUID string                      `json:"classUID"`
-	Binding  storagev1.VolumeBindingMode `json:"binding"`
-	PVName   string                      `json:"pvName,omitempty"`
-	PVUID    string                      `json:"pvUID,omitempty"`
-	Handle   string                      `json:"handle,omitempty"`
+type outerClaim struct {
+	Name string `json:"name"`
+	UID  string `json:"uid"`
 }
-type backingJournal struct {
-	Config backingConfig `json:"config"`
-	Owner  string        `json:"owner"`
-	Origin backingClaim  `json:"origin"`
-	Cache  backingClaim  `json:"cache"`
+type externalClaim struct {
+	Name      string `json:"name"`
+	UID       string `json:"uid"`
+	PVName    string `json:"pvName"`
+	PVUID     string `json:"pvUID"`
+	ClassName string `json:"className"`
+	ClassUID  string `json:"classUID"`
+	Driver    string `json:"driver"`
+	Handle    string `json:"handle"`
+	Bytes     int64  `json:"bytes"`
 }
-
-// KubernetesSource must use a separate uncached, read-only client and
-// credentials. API availability is required only inside the opt-in domain.
-// Namespace admission/RBAC must prohibit backing PVC consumers and writes by
-// workloads; absence in a list alone cannot prevent a concurrent Pod create.
-type KubernetesSource struct {
-	Reader client.Reader
-	Config DynamicConfig
+type externalJournal struct {
+	Version int            `json:"version"`
+	Owner   string         `json:"owner"`
+	Config  externalConfig `json:"config"`
+	Outer   outerClaim     `json:"outer"`
+	Origin  externalClaim  `json:"origin"`
+	Cache   externalClaim  `json:"cache"`
 }
 
-func parseBacking(v *unstructured.Unstructured) (backingJournal, error) {
-	var j backingJournal
-	for k := range v.GetAnnotations() {
-		if strings.HasPrefix(k, backingPrefix+"backing-pvcs-") && k != BackingJournalKey {
-			return j, ErrUncertain
-		}
-	}
-	d := json.NewDecoder(strings.NewReader(v.GetAnnotations()[BackingJournalKey]))
+func decodeExternal(raw string) (externalJournal, error) {
+	var j externalJournal
+	d := json.NewDecoder(strings.NewReader(raw))
 	d.DisallowUnknownFields()
-	if err := d.Decode(&j); err != nil {
-		return j, ErrUncertain
-	}
-	if d.Decode(new(any)) != io.EOF || !slices.Contains(v.GetFinalizers(), backingFinalizer) {
+	if err := d.Decode(&j); err != nil || d.Decode(new(any)) != io.EOF || j.Version != 1 {
 		return j, ErrUncertain
 	}
 	return j, nil
 }
 
+func parseExternal(v *unstructured.Unstructured) (externalJournal, error) {
+	for key := range v.GetAnnotations() {
+		if strings.HasPrefix(key, sourcePrefix+"backing-pvcs-") ||
+			strings.HasPrefix(key, sourcePrefix+"external-source-pvcs-") && key != ExternalSourceKey {
+			return externalJournal{}, ErrUncertain
+		}
+	}
+	if slices.Contains(v.GetFinalizers(), sourcePrefix+"backing-pvcs") {
+		return externalJournal{}, ErrUncertain
+	}
+	return decodeExternal(v.GetAnnotations()[ExternalSourceKey])
+}
+
+func validSourceName(s string) bool { return s != "" && len(validation.IsDNS1123Subdomain(s)) == 0 }
+
+func (j externalJournal) pins(c DynamicConfig, composite, uid string, n int64) error {
+	cfg := j.Config
+	if !c.valid() || !compositeName.MatchString(composite) || uid == "" || j.Version != 1 || j.Owner != composite+"."+uid ||
+		cfg.Namespace != c.Namespace || cfg.NamespaceUID != c.NamespaceUID || cfg.NodeName != c.NodeName ||
+		cfg.NodeUID != c.NodeUID || !validDrivers(cfg.OriginDriver, cfg.CacheDriver) ||
+		originDriver(cfg.OriginDriver) != c.OriginDriverName() || cacheDriver(cfg.CacheDriver) != c.CacheDriverName() ||
+		!validSourceName(j.Outer.Name) || j.Outer.UID == "" || j.Origin.Name == j.Cache.Name ||
+		j.Origin.Name == j.Outer.Name || j.Cache.Name == j.Outer.Name ||
+		j.Cache.ClassName != c.CacheClass || j.Cache.ClassUID != c.CacheClassUID || n != c.Bytes || j.Cache.Bytes != n ||
+		j.Origin.Driver != c.OriginDriverName() || j.Cache.Driver != c.CacheDriverName() {
+		return ErrUncertain
+	}
+	for _, p := range []externalClaim{j.Origin, j.Cache} {
+		if !validSourceName(p.Name) || !validSourceName(p.PVName) || !validSourceName(p.ClassName) ||
+			p.UID == "" || p.PVUID == "" || p.ClassUID == "" || p.Driver == "" || p.Handle == "" ||
+			p.Bytes <= 0 || p.Bytes%512 != 0 {
+			return ErrUncertain
+		}
+	}
+	vg, lv, ok := strings.Cut(j.Cache.Handle, "#")
+	if !ok || vg != c.VolumeGroup || !pvcLV.MatchString(lv) {
+		return ErrUncertain
+	}
+	return nil
+}
+
+func (j externalJournal) canonical() string {
+	if j.Config.OriginDriver == OfficialOriginDriver {
+		j.Config.OriginDriver = ""
+	}
+	if j.Config.CacheDriver == OfficialCacheDriver {
+		j.Config.CacheDriver = ""
+	}
+	b, _ := json.Marshal(j)
+	return string(b)
+}
+
+// KubernetesSource is a separate, uncached, read-only client. Outer annotations
+// express references only, never placement, device identity or ownership proof.
+type KubernetesSource struct {
+	Reader client.Reader
+	Config DynamicConfig
+}
+
 func (k KubernetesSource) Resolve(ctx context.Context, composite string, n int64) (Candidate, error) {
-	return k.resolve(ctx, composite, n, false)
-}
-
-func (k KubernetesSource) ResolveCommitted(ctx context.Context, composite string, n int64) (Candidate, error) {
-	return k.resolve(ctx, composite, n, true)
-}
-
-func (k KubernetesSource) resolve(ctx context.Context, composite string, n int64, receiptOnly bool) (Candidate, error) {
 	fail := func() (Candidate, error) { return Candidate{}, ErrUncertain }
 	c := k.Config
-	if !c.valid() || k.Reader == nil || !compositeName.MatchString(composite) || n != c.Bytes {
+	if !c.valid() || k.Reader == nil || !compositeName.MatchString(composite) {
 		return fail()
 	}
 	v := &unstructured.Unstructured{}
@@ -106,20 +143,10 @@ func (k KubernetesSource) resolve(ctx context.Context, composite string, n int64
 	if err := k.Reader.Get(ctx, client.ObjectKey{Name: composite}, v); err != nil {
 		return Candidate{}, err
 	}
-	j, err := parseBacking(v)
-	if err != nil || v.GetUID() == "" || v.GetResourceVersion() == "" || !receiptOnly && v.GetDeletionTimestamp() != nil ||
-		v.GetNamespace() != "" || len(v.GetOwnerReferences()) != 0 ||
-		j.Owner != composite+"."+string(v.GetUID()) ||
-		v.GetAnnotations()[backingPrefix+"selected-node"] != c.NodeName {
-		return fail()
-	}
-	cfg := j.Config
-	if !validDrivers(cfg.OriginDriver, cfg.CacheDriver) ||
-		originDriver(cfg.OriginDriver) != c.OriginDriverName() || cacheDriver(cfg.CacheDriver) != c.CacheDriverName() ||
-		cfg.Namespace != c.Namespace || cfg.NamespaceUID != c.NamespaceUID || cfg.NodeName != c.NodeName ||
-		cfg.NodeUID != c.NodeUID || cfg.CacheStorageClass != c.CacheClass || j.Cache.ClassUID != c.CacheClassUID ||
-		cfg.CacheBytes != n || cfg.OriginBytes <= 0 || cfg.OriginBytes%512 != 0 ||
-		cfg.OriginStorageClass == "" || cfg.OriginStorageClass == cfg.CacheStorageClass {
+	j, err := parseExternal(v)
+	if err != nil || v.GetDeletionTimestamp() != nil || v.GetResourceVersion() == "" || v.GetNamespace() != "" ||
+		j.pins(c, composite, string(v.GetUID()), n) != nil ||
+		v.GetAnnotations()[sourcePrefix+"selected-node"] != c.NodeName {
 		return fail()
 	}
 	originBytes, _, _ := unstructured.NestedInt64(v.Object, "spec", "capacity")
@@ -127,9 +154,9 @@ func (k KubernetesSource) resolve(ctx context.Context, composite string, n int64
 	provider, _, _ := unstructured.NestedString(v.Object, "spec", "cacheParameters", "provider")
 	pool, _, _ := unstructured.NestedString(v.Object, "spec", "cacheParameters", "poolID")
 	request, _, _ := unstructured.NestedString(v.Object, "spec", "cacheParameters", "requestID")
-	topologyNode, _, _ := unstructured.NestedString(v.Object, "spec", "topology", backingPrefix+"node")
-	if originBytes != cfg.OriginBytes || cacheBytes != cfg.CacheBytes || provider != c.PoolUUID || pool != OrdinaryPool ||
-		topologyNode != c.NodeName || request == "" {
+	nodeName, _, _ := unstructured.NestedString(v.Object, "spec", "topology", sourcePrefix+"node")
+	if originBytes != j.Origin.Bytes || cacheBytes != j.Cache.Bytes || provider != c.PoolUUID ||
+		pool != OrdinaryPool || request == "" || nodeName != c.NodeName {
 		return fail()
 	}
 	var namespace corev1.Namespace
@@ -141,25 +168,26 @@ func (k KubernetesSource) resolve(ctx context.Context, composite string, n int64
 		return Candidate{}, err
 	}
 	if string(namespace.UID) != c.NamespaceUID || namespace.DeletionTimestamp != nil ||
-		namespace.Labels[backingPrefix+"backing-namespace"] != "v1" || len(namespace.OwnerReferences) != 0 ||
-		string(node.UID) != c.NodeUID || node.DeletionTimestamp != nil || !receiptOnly && node.Spec.Unschedulable {
+		string(node.UID) != c.NodeUID || node.DeletionTimestamp != nil || node.Spec.Unschedulable {
 		return fail()
 	}
-	for _, side := range []struct {
-		role, class, driver string
-		bytes               int64
-		pin                 backingClaim
-	}{
-		{"origin", cfg.OriginStorageClass, originDriver(cfg.OriginDriver), cfg.OriginBytes, j.Origin},
-		{"cache", cfg.CacheStorageClass, cacheDriver(cfg.CacheDriver), cfg.CacheBytes, j.Cache},
-	} {
-		if err := k.checkBinding(ctx, j.Owner, &node, side.role, side.class, side.driver, side.bytes, side.pin); err != nil {
+	var outer corev1.PersistentVolumeClaim
+	if err := k.Reader.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: j.Outer.Name}, &outer); err != nil {
+		return Candidate{}, err
+	}
+	size := outer.Spec.Resources.Requests[corev1.ResourceStorage]
+	if string(outer.UID) != j.Outer.UID || outer.DeletionTimestamp != nil ||
+		outer.Annotations[sourcePrefix+"origin-pvc"] != j.Origin.Name ||
+		outer.Annotations[sourcePrefix+"cache-pvc"] != j.Cache.Name ||
+		outer.Spec.VolumeMode != nil && *outer.Spec.VolumeMode != corev1.PersistentVolumeFilesystem ||
+		!slices.Equal(outer.Spec.AccessModes, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}) ||
+		size.CmpInt64(j.Origin.Bytes) != 0 {
+		return fail()
+	}
+	for _, pin := range []externalClaim{j.Origin, j.Cache} {
+		if err := k.checkBinding(ctx, &node, pin); err != nil {
 			return Candidate{}, err
 		}
-	}
-	vg, lv, ok := strings.Cut(j.Cache.Handle, "#")
-	if !ok || vg != c.VolumeGroup || !pvcLV.MatchString(lv) {
-		return fail()
 	}
 	var pods corev1.PodList
 	if err := k.Reader.List(ctx, &pods, client.InNamespace(c.Namespace)); err != nil {
@@ -172,42 +200,31 @@ func (k KubernetesSource) resolve(ctx context.Context, composite string, n int64
 			}
 		}
 	}
-	// Re-read the authoritative CR, not an informer snapshot. Deletion or
-	// identity mutation during the dependency reads cannot be accepted.
 	again := v.DeepCopy()
 	if err := k.Reader.Get(ctx, client.ObjectKey{Name: composite}, again); err != nil {
 		return Candidate{}, err
 	}
-	if again.GetUID() != v.GetUID() || again.GetResourceVersion() != v.GetResourceVersion() ||
-		!receiptOnly && again.GetDeletionTimestamp() != nil {
+	if again.GetUID() != v.GetUID() || again.GetResourceVersion() != v.GetResourceVersion() || again.GetDeletionTimestamp() != nil {
 		return fail()
 	}
-	// Semantic default equivalence for fingerprints only; never rewrite the
-	// authoritative annotation or change the old omitted-field serialization.
-	if j.Config.OriginDriver == OfficialOriginDriver {
-		j.Config.OriginDriver = ""
+	var currentOuter corev1.PersistentVolumeClaim
+	if err := k.Reader.Get(ctx, client.ObjectKeyFromObject(&outer), &currentOuter); err != nil {
+		return Candidate{}, err
 	}
-	if j.Config.CacheDriver == OfficialCacheDriver {
-		j.Config.CacheDriver = ""
+	if currentOuter.UID != outer.UID || currentOuter.ResourceVersion != outer.ResourceVersion || currentOuter.DeletionTimestamp != nil {
+		return fail()
 	}
-	b, _ := json.Marshal(j)
+	snapshot := j.canonical()
 	return Candidate{CompositeID: composite, CompositeUID: string(v.GetUID()), VolumeHandle: j.Cache.Handle,
-		Fingerprint: fmt.Sprintf("%x", sha256.Sum256(b)), RequestID: request}, nil
+		Fingerprint: fmt.Sprintf("%x", sha256.Sum256([]byte(snapshot))), RequestID: request, Snapshot: snapshot}, nil
 }
 
-func (k KubernetesSource) checkBinding(ctx context.Context, owner string, node *corev1.Node, role, class, driver string, n int64, pin backingClaim) error {
-	hash := sha256.Sum256([]byte(owner))
-	if pin.Name != fmt.Sprintf("dmstack-%x-%s", hash[:20], role) || pin.UID == "" || pin.ClassUID == "" ||
-		pin.PVName == "" || pin.PVUID == "" || pin.Handle == "" {
-		return ErrUncertain
-	}
+func (k KubernetesSource) checkBinding(ctx context.Context, node *corev1.Node, pin externalClaim) error {
 	var sc storagev1.StorageClass
-	if err := k.Reader.Get(ctx, client.ObjectKey{Name: class}, &sc); err != nil {
+	if err := k.Reader.Get(ctx, client.ObjectKey{Name: pin.ClassName}, &sc); err != nil {
 		return err
 	}
-	if string(sc.UID) != pin.ClassUID || sc.DeletionTimestamp != nil || sc.Provisioner != driver ||
-		sc.VolumeBindingMode == nil || *sc.VolumeBindingMode != pin.Binding ||
-		(pin.Binding != storagev1.VolumeBindingImmediate && pin.Binding != storagev1.VolumeBindingWaitForFirstConsumer) {
+	if string(sc.UID) != pin.ClassUID || sc.DeletionTimestamp != nil || sc.Provisioner != pin.Driver {
 		return ErrUncertain
 	}
 	if len(sc.AllowedTopologies) != 0 {
@@ -223,7 +240,7 @@ func (k KubernetesSource) checkBinding(ctx context.Context, owner string, node *
 			return ErrUncertain
 		}
 	}
-	if role == "cache" {
+	if pin.Driver == k.Config.CacheDriverName() {
 		vg := sc.Parameters["volumeGroup"]
 		if vg == "" {
 			vg = "containerstorage"
@@ -240,26 +257,19 @@ func (k KubernetesSource) checkBinding(ctx context.Context, owner string, node *
 	if err := k.Reader.Get(ctx, client.ObjectKey{Name: pin.PVName}, &pv); err != nil {
 		return err
 	}
-	selected := pvc.Annotations["volume.kubernetes.io/selected-node"]
-	q := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	requested := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 	capacity := pv.Spec.Capacity[corev1.ResourceStorage]
 	claimCapacity := pvc.Status.Capacity[corev1.ResourceStorage]
 	if string(pvc.UID) != pin.UID || pvc.DeletionTimestamp != nil || pvc.Status.Phase != corev1.ClaimBound ||
-		pvc.Spec.VolumeName != pin.PVName || pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != class ||
+		pvc.Spec.VolumeName != pin.PVName || pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != pin.ClassName ||
 		pvc.Spec.VolumeMode == nil || *pvc.Spec.VolumeMode != corev1.PersistentVolumeBlock ||
 		!slices.Equal(pvc.Spec.AccessModes, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}) ||
-		q.CmpInt64(n) != 0 || len(pvc.Spec.Resources.Limits) != 0 || pvc.Spec.Selector != nil ||
-		pvc.Spec.DataSource != nil || pvc.Spec.DataSourceRef != nil || pvc.Spec.VolumeAttributesClassName != nil ||
-		pvc.Annotations[backingPrefix+"composite-handle"] != owner || pvc.Annotations[backingPrefix+"backing-role"] != role ||
-		len(pvc.OwnerReferences) != 0 || !slices.Contains(pvc.Finalizers, backingFinalizer) ||
-		selected != "" && selected != node.Name ||
-		pin.Binding == storagev1.VolumeBindingWaitForFirstConsumer && selected != node.Name ||
-		role == "cache" && pvc.Annotations["localdisk.csi.acstor.io/accept-ephemeral-storage"] != "true" ||
+		requested.CmpInt64(pin.Bytes) != 0 ||
 		string(pv.UID) != pin.PVUID || pv.DeletionTimestamp != nil || pv.Status.Phase != corev1.VolumeBound ||
 		pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.UID != pvc.UID || pv.Spec.ClaimRef.Namespace != pvc.Namespace || pv.Spec.ClaimRef.Name != pvc.Name ||
-		pv.Spec.CSI == nil || pv.Spec.CSI.Driver != driver || pv.Spec.CSI.VolumeHandle != pin.Handle || pv.Spec.CSI.ReadOnly ||
-		pv.Spec.StorageClassName != class || pv.Spec.VolumeMode == nil || *pv.Spec.VolumeMode != corev1.PersistentVolumeBlock ||
-		!slices.Equal(pv.Spec.AccessModes, pvc.Spec.AccessModes) || capacity.CmpInt64(n) != 0 || claimCapacity.Cmp(capacity) != 0 ||
+		pv.Spec.CSI == nil || pv.Spec.CSI.Driver != pin.Driver || pv.Spec.CSI.VolumeHandle != pin.Handle || pv.Spec.CSI.ReadOnly ||
+		pv.Spec.StorageClassName != pin.ClassName || pv.Spec.VolumeMode == nil || *pv.Spec.VolumeMode != corev1.PersistentVolumeBlock ||
+		!slices.Equal(pv.Spec.AccessModes, pvc.Spec.AccessModes) || capacity.CmpInt64(pin.Bytes) != 0 || claimCapacity.Cmp(capacity) != 0 ||
 		!sourceNodeMatches(pv.Spec.NodeAffinity, node) {
 		return ErrUncertain
 	}
@@ -285,7 +295,20 @@ func sourceNodeMatches(a *corev1.VolumeNodeAffinity, node *corev1.Node) bool {
 	return false
 }
 
-// DecodeDynamicConfig rejects unrecognized administrator configuration too.
+func (s *ledger) validateSourceSnapshot() error {
+	if s.Dynamic == nil || s.Dynamic.Source == nil || s.Dynamic.Source.Snapshot == "" {
+		return nil // preserved legacy hold; never a new external-source admission
+	}
+	c := s.Dynamic.Source
+	j, err := decodeExternal(c.Snapshot)
+	if err != nil || j.pins(s.Dynamic.Config, c.CompositeID, c.CompositeUID, s.Dynamic.Config.Bytes) != nil ||
+		j.canonical() != c.Snapshot || fmt.Sprintf("%x", sha256.Sum256([]byte(c.Snapshot))) != c.Fingerprint ||
+		j.Cache.Handle != c.VolumeHandle || s.Canary == nil || s.Canary.VolumeHandle != c.VolumeHandle {
+		return ErrUncertain
+	}
+	return nil
+}
+
 func DecodeDynamicConfig(data []byte) (DynamicConfig, error) {
 	var c DynamicConfig
 	d := json.NewDecoder(bytes.NewReader(data))

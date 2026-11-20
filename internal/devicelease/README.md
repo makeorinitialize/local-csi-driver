@@ -1,22 +1,67 @@
-# Node-local raw cache reservations
+# Existing-source PVC holds and native custody
 
-## Online single-canary backing PVC enrollment
+The active canary resolves **externally owned, already Bound origin and cache
+PVCs**. It owns use authorization, retained descriptors and cleanup evidence,
+not the PVCs, PVs or physical provisioning lifecycle. Composite deletion must
+close only its mappings/holds; it must never delete either source PVC/PV.
 
-This is a separate, strictly opt-in replacement for the **offline enrollment**
-step below. It imports the existing ordinary raw Block LV on authenticated
-`Reserve`; it does not allocate another volume or initialize/format its media.
-The DeviceProvider wire API is unchanged. **Only one composite, one node,
-one backing namespace, one cache class, and one LV incarnation are supported.**
+V1 requires a preformatted ext4 origin and an existing raw Block cache, both
+compatible with the independently pinned node. ACS does not format either
+device. No fresh-create provenance, first-format API or implicit creation is a
+runtime prerequisite. Source devices are internal runtime inputs, never
+application `volumeDevices`; the application sees the final filesystem.
 
-### Separate CSI instance, never an addon replacement
+## Exact external-source contract
 
-Online mode requires an independently registered CSI name, separate node and
-controller sockets, and its own persistent plugin/journal mount. The managed
-`localdisk.csi.acstor.io` instance is not replaced or reconfigured. Example
-bootstrap for a separate process (not a deployment performed by this code):
+The actual outer application PVC supplies same-namespace references:
+
+```yaml
+metadata:
+  annotations:
+    dmstack.csi.infinitydb.io/origin-pvc: existing-origin
+    dmstack.csi.infinitydb.io/cache-pvc: existing-cache
+```
+
+The controller reads the real outer PVC using CSI Create's PVC name/namespace,
+pins its UID and references before provider effects, and publishes annotation
+`dmstack.csi.infinitydb.io/external-source-pvcs-v1` on CompositeVolume.
+Its exact independent field contract is in
+`testdata/external-source-pvcs-v1.json`:
 
 ```text
-ACS_DYNAMIC_BLOCK=1 ACS_RAW_CACHE=1 ACS_HOST_CUSTODY=1
+{version:1, owner, config, outer, origin, cache}
+config = {namespace,namespaceUID,nodeName,nodeUID,originDriver?,cacheDriver?}
+outer = {name,uid}
+origin/cache = {name,uid,pvName,pvUID,className,classUID,driver,handle,bytes}
+```
+
+Order matches the controller's canonical serialization. `owner` is Composite
+**NAME.UID**, never the outer UID. Incomplete owner, unknown versions/fields,
+self/same references, namespace/ordinal expansion and old `backing-pvcs-v1`
+objects fail closed. No deterministic claim names, source ownership annotations,
+special namespace labels, binding-mode provenance, or source finalizers are
+required or written.
+
+The independent read-only API client checks the real outer UID and annotations,
+outer Filesystem/RWO/requested size, both source Block/RWO bindings, PVC/PV/class
+UIDs, exact claimRefs/drivers/handles/capacities and node placement. Existing
+source consumers are rejected. Outer annotations are references, not placement
+configuration or device evidence. Actual VG/LV/kernel identity is separately
+observed by the provider; a name or supplied stable ID never enrolls media.
+
+The optional config driver names default to `disk.csi.azure.com` and
+`localdisk.csi.acstor.io`. They are exact lowercase DNS names of at most 63
+characters, distinct and not the other role's official alias. Explicit identical
+defaults are semantically equal without rewriting API bytes. Per-source
+`driver` is always explicit. IDs/handles are never case-folded or normalized.
+
+## Separate canary process, never an addon replacement
+
+Online mode requires independent registration, plugin/journal storage and an
+exclusive pre-provisioned nondefault VG:
+
+```text
+ACS_DYNAMIC_BLOCK=1 ACS_RAW_CACHE=1
 --driver-name=localdisk.dmstack.infinitydb.io
 --canary-volume-group=dmstack-canary
 --ordinary-journal-directory=/csi-canary/hold
@@ -26,660 +71,157 @@ ACS_DYNAMIC_BLOCK=1 ACS_RAW_CACHE=1 ACS_HOST_CUSTODY=1
 --node-name=<exact canary node>
 ```
 
-Mount `/csi-canary` from that driver's own persistent host plugin directory,
-not the managed addon's directory. Configure its separate node-driver-registrar
-to the corresponding host `.../plugins/<canary-driver-name>/node.sock`, with
-its own registration, CSIDriver object, RBAC and StorageClass. CSI identity,
-topology keys, capacity metadata and GC filters use the configured process
-name. The managed-addon webhook mode is not used.
+Give this process its own persistent host plugin mount/registrar/CSIDriver/RBAC/
+StorageClass, not the managed addon's paths or identity. Its VG must have tag
+`dmstack.csi.localdisk.dmstack.infinitydb.io`, **without** `local-csi`.
+The source cache class must explicitly select `volumeGroup: dmstack-canary`.
+Actual UUID/tag are checked before serving. Foreign VG/mapper aliases,
+automatic disk/VG creation, broad pool cleanup and ephemeral CSI lifecycle are
+disabled. Qualify the installed managed addon's tag/device exclusion separately;
+a different CSI name alone does not establish physical isolation.
 
-The existing private VG must have the exact tag
-`dmstack.csi.localdisk.dmstack.infinitydb.io` in this example, **without**
-`local-csi`. It must not be `containerstorage` or another driver's VG.
-Canary StorageClass `parameters.volumeGroup` must explicitly name this VG.
-Startup verifies its actual UUID and owner tag; the source reader requires the
-configured cache driver to equal the actual serving identity and exact SC/PV
-drivers. All foreign VG handles and mapper aliases are rejected. Automatic
-disk/VG creation, broad pool cleanup and ephemeral CSI lifecycle are disabled
-in the alias process; native PVC/LV reclamation remains scoped to its private
-VG. Never rely on a new CSI name alone to exclude the managed addon's LVM
-scanners. Qualify the installed addon version's tag/device exclusion before
-deployment; no such live qualification or addon modification is performed here.
+Mount root-owned, non-group/world-writable configuration into the driver only:
 
-The canonical journal adds optional `originDriver` and `cacheDriver` after
-`cacheBytes`. Absent fields still mean the official defaults. Explicit identical
-defaults compare equally without rewriting old journal bytes; custom values
-are exact, lowercase DNS names, at most 63 characters, distinct and not the
-other role's official driver. Root `domain.json` pins `OriginDriver` and
-`CacheDriver` using these same effective names. This is separate from wire
-provider/pool IDs, which remain actual VG UUID / `acs-disposable-block`.
-There is no migration/relabeling of an old official-name allocation into the
-new domain, and no normalization of VG, PV, LV or Azure resource IDs.
+`/etc/acs-dmstack-enrollment/domain.json`:
 
-### Setup contract (operator actions; nothing is deployed by this change)
-
-1. Use a dedicated, isolated canary node and an existing healthy private VG.
-   Record its actual VG UUID. The node must have no older/parallel ACS writers,
-   surviving commands from an older driver, privileged workload access, or
-   external LVM writers. Do not hot-enable this on a running unguarded driver.
-   Start this protecting binary with the domain armed **before provisioning
-   the backing PVC**. Thereafter enrollment requires **no driver restart**.
-   The exclusive lifetime `/csi-node` parent lock rejects overlapping drivers
-   using the existing enrollment pin; old binaries without that pin are
-   unsupported. Upgrading a populated node requires independently proven host
-   quiescence, not merely observing that its old driver process exited.
-2. Keep the isolated persistent, root-owned plugin mount, for example
-   `/csi-canary`. The driver creates the configured journal directory
-   (`/csi-canary/hold` above) once, with a version-4 ledger.
-   Do not pre-create that subdirectory. Existing offline/v3 journals are not
-   upgraded; missing/corrupt journals, changed domain pins and flag-off startup
-   against v4 fail closed. Never delete, reset, clone or independently restore
-   the ledger. An uncertain or retired single slot is not reusable.
-3. Mount a root-owned, read-only `/etc/acs-dmstack-enrollment` into the driver
-   only (not facade/workload pods). Set `ACS_DYNAMIC_BLOCK=1` and
-   `ACS_RAW_CACHE=1`. Put `domain.json` there, with these exact fields:
-
-   ```json
-   {
-     "NodeName": "worker-a",
-     "NodeUID": "<API node UID>",
-     "Namespace": "isolated-backing",
-     "NamespaceUID": "<API namespace UID>",
-     "CacheClass": "canary-acs-block",
-     "CacheClassUID": "<API StorageClass UID>",
-     "VolumeGroup": "dmstack-canary",
-     "PoolUUID": "<actual existing VG UUID>",
-     "Bytes": 1073741824,
-     "OriginDriver": "disk.dmstack.infinitydb.io",
-     "CacheDriver": "localdisk.dmstack.infinitydb.io"
-   }
-   ```
-
-   `Bytes` must equal the journal, PVC request/status, PV capacity and actual
-   LV size exactly; account for LVM extent rounding when choosing it.
-4. Put `reader.kubeconfig` in that same protected mount. It must have exactly
-   one context, cluster and dedicated read-only identity, an HTTPS API-server
-   address, embedded `certificate-authority-data`, and either embedded mTLS
-   credentials or a dedicated token. A rotating `tokenFile` is allowed only
-   inside this directory, root-owned and not group/world writable. Exec/auth
-   plugins, proxies, insecure TLS and ambient/in-cluster fallback are rejected.
-   Restrict network egress to that API server and ingress on the provider port
-   to the authenticated facade. Do not mount these credentials into workloads.
-   The independent uncached reader needs:
-
-   | Scope | Resources | Verbs |
-   | --- | --- | --- |
-   | cluster | `storage.infinitydb.io/compositevolumes` | `get` |
-   | cluster | core `nodes`, `namespaces`, `persistentvolumes` | `get` |
-   | cluster | `storage.k8s.io/storageclasses` | `get` |
-   | pinned backing namespace only | core `persistentvolumeclaims` | `get` |
-   | pinned backing namespace only | core `pods` | `list` |
-
-   Use `resourceNames` for the pinned node, namespace and classes (including
-   the origin class); narrow CR/PV/PVC reads to planned names where possible.
-   No update/patch/create/delete, secrets, pod exec, token creation, node proxy,
-   or status-write permission is needed. Normal API discovery access is needed
-   by the REST mapper. Namespace label
-   `dmstack.csi.infinitydb.io/backing-namespace=v1` is required. Restrict
-   CR/spec/status/finalizer and backing-resource writes to the trusted facade
-   and Kubernetes storage controllers. Enforce admission/RBAC prohibiting
-   backing-claim consumer pods and privileged/raw host access. Labels and an
-   empty pod list are checks, **not substitutes for that access policy**.
-5. Configure the existing node-specific mTLS RPC listener and policy below
-   with `localCustody: true`, provider equal to `PoolUUID`, and pool
-   `acs-disposable-block`. `composite_volume_id` is the authoritative
-   CompositeVolume **name**, not its `name.UID` CSI handle. The journal's
-   `owner` is independently checked as `name.UID`. Prefer an exact composite
-   allowlist. The facade must produce the canonical
-   `dmstack.csi.infinitydb.io/backing-pvcs-v1` annotation and finalizer with
-   **both** verified Bound Block bindings before requesting Reserve.
-   The Reserve request ID must exactly equal `spec.cacheParameters.requestID`;
-   it is pinned with the source identity and cannot be changed on replay.
-   No pod annotations, caller-supplied paths or stable device IDs enroll media.
-   Unknown journal versions/fields are rejected. The independent field
-   contract is exercised by `testdata/backing-pvcs-v1.json`.
-
-The reader checks the full journal, CR UID/deletion/finalizer, capacities and
-provider topology, node and namespace UIDs, both class/PVC/PV UIDs, claimRefs,
-CSI drivers/handles, selected-node/affinity, and absence of claim consumers.
-The backend reads the real LV UUID and verifies VG/LV/sysfs identity. It takes
-an exclusive FD, verifies no holders/host raw publishes, rechecks the source,
-and keeps that FD through the fsynced reservation commit. `GetCapacity` reports
-zero before an authoritative candidate exists; Reserve is the discovery entry
-point, not a promise that an arbitrary PVC can be adopted.
-
-### Ordering and crash behavior
-
-The extra provider-internal v4 state is necessary: a Kubernetes read cannot
-atomically commit with a local journal or prevent CR deletion. Before attempting
-the exclusive FD, the provider durably records the candidate, its complete
-journal fingerprint and an **admission-pending hold**. Success commits the
-reservation under that hold; source deletion/change is checked again before
-returning and on subsequent lookup/acquire/validate/renew. Exact committed
-Reserve replay/GetLease can recover their existing receipt while the same CR
-is deleting, but still require every UID, binding and spec request ID to match.
-This receipt-only read cannot admit a new candidate or authorize node access.
-Completely missing/replaced source and new grants fail closed. Deletion or API
-failure never releases local ownership. A failed/interrupted admission remains
-held and cannot be automatically retried into a new allocation.
-
-All native data access/destructive paths use the armed gate before side effects:
-publish/stage/unpublish/unstage, stats device opens, expansion, delete,
-quarantine/tag recovery, wipe reaper, GC pre-delete unmount/removal and pool
-setup/recovery/removal. Native admission writes an append-only handle/UUID/
-target tombstone **even when no enrollment exists yet**. Thus a handler that
-has passed `BeforePhysical` cannot later destroy newly enrolled media: that
-handle can never enroll. Provisioning is the sole non-retiring exception:
-each EnsureVolume invocation records a durable pending token before LVM,
-cleared only by that invocation after successful completion. Reserve refuses
-pending or crash-uncertain allocations. Pool-wide mapper operations retire
-only that VG's enrollment domain. Unrelated handles/other VGs remain usable;
-uncertainty does not freeze the node's ordinary volumes.
-
-A lost successful Reserve reply replays the same lease/incarnation after restart.
-An interrupted admission retains the slot; native teardown stays denied.
-Successful independent node release retires acquisition rights, but this dynamic
-domain retains native teardown exclusion until allocation authorization closure
-below. Neither transition permits a second enrollment of the retired LV or
-another LV in that slot. Disabling RPC does not disable the protecting gate.
-Downgrade while a dynamic domain exists is unsupported.
-
-### Irreversible allocation authorization closure
-
-The existing v1 `Release` RPC supports `RELEASE_MODE_ALLOCATION` **only for
-this dynamic single-canary domain**. It closes provider use authorization; it
-does not unmount, deactivate, wipe, remove or otherwise touch an LV. The normal
-backing PVC/PV CSI lifecycle still owns all physical reclamation.
-
-The authenticated controller sends:
-
-```text
-request_id: stable unique closure operation ID
-allocation: exact tuple returned by Reserve (provider/lease/composite/resource/stable ID/generation)
-owner_epoch: 0 if never acquired, otherwise the exact verified released epoch
-mode: RELEASE_MODE_ALLOCATION
-node_id: ""
-cleanup_receipt_id: ""
+```json
+{
+  "NodeName": "worker-a", "NodeUID": "<node UID>",
+  "Namespace": "applications", "NamespaceUID": "<namespace UID>",
+  "CacheClass": "canary-cache", "CacheClassUID": "<class UID>",
+  "VolumeGroup": "dmstack-canary", "PoolUUID": "<actual VG UUID>",
+  "Bytes": 1073741824,
+  "OriginDriver": "disk.dmstack.infinitydb.io",
+  "CacheDriver": "localdisk.dmstack.infinitydb.io"
+}
 ```
 
-For example, the facade uses `release-<spec.cacheParameters.requestID>-<epoch>`.
-No identifier is normalized, no caller-supplied path is resolved, and no new
-wire field or receipt format is introduced. Admission requires positive local
-journal evidence, serialized with Reserve, Acquire and native operations:
+Cache class/bytes remain administrator *restrictions in this domain
+configuration*, compared against the cache role pins; they are not fields in
+the external journal config and do not request provisioning.
+`reader.kubeconfig` in the same directory must contain one explicit read-only
+identity/context, HTTPS with embedded CA, and dedicated token or embedded mTLS.
+No ambient/in-cluster fallback, exec/auth plugins, insecure TLS or proxies.
+Reader permissions: get CompositeVolumes/nodes/namespaces/PVs/StorageClasses;
+get PVCs and list Pods only in the configured namespace. No source write/delete
+permission is needed. Restrict resourceNames, network paths and source access
+by namespace RBAC/admission; no arbitrary privileged/raw-device consumers.
 
-- **Never acquired:** the complete reservation was durably committed,
-  enrollment is not pending, the node Claim is absent, the acquisition mutation
-  history is empty, and expected epoch is exactly zero.
-- **Verified released:** the exact node release is durably `Done`, with the
-  matching allocation and epoch, retired acquisition rights and an empty
-  released Claim. Acquired, Held, Preparing, Closing, expired, missing or
-  otherwise uncertain states are not eligible.
+The existing mTLS provider files remain in `/etc/acs-dmstack-provider`:
+`tls.crt`, `tls.key`, `client-ca.crt`, `policy.json`. Policy pins actual
+**VG UUID**, exact controller/node certificate URI scopes and `localCustody:true`.
+Route directly to this node's endpoint, never a multi-node provider alias.
+Wire pool remains **`acs-disposable-block`**, not a driver or class name.
+Reserve uses CompositeVolume **NAME**, sealed `spec.cacheParameters.requestID`
+and exact cache bytes; it returns RESERVED before node acquisition.
 
-Dynamic Acquire now journals `preparing` **before** dispatching any authority
-check or exclusive probe. Thus a crash/error before returning its receipt is
-not mistaken for "never acquired." That uncertainty retains the hold and cannot
-be automatically canceled or reacquired. TTL expiry remains a retained Held
-state, never permission to close or reclaim.
+## Durable ownership, independent of API lifetime
 
-Closure atomically saves the exact request, allocation and epoch as a permanent
-tombstone while retaining all existing request/generation/mutation history.
-Only after that commit may normal native delete/unpublish/GC proceed. Late
-Acquire and Reserve, including old successful request replays, cannot reopen
-the slot. Verified ReleaseNode alone no longer permits native reclamation in
-this dynamic domain; legacy offline enrollment behavior is unchanged.
+Enrollment durably retains the **full canonical verified source snapshot**,
+fingerprint, CR incarnation, request binding and observed VG/LV identity.
+Ordinary CSI/GC admission participates before enrollment: irreversible native
+tombstones and pending provision intents prevent late commands from destroying
+newly held media. The candidate/admission intent is saved before probing;
+unknown outcomes remain held. Never reset/copy/restore the journal independently
+of its media. The persistent parent is pinned before any handlers start.
 
-An exact committed Release replay is history-only and succeeds after source
-CR/PVC deletion, API outage, physical LV removal or provider restart. A changed
-request, allocation or epoch conflicts rather than replacing that history.
-For the exact recorded provider/lease key, GetLease returns **NotFound only
-after authoritative closure**, independently of live source/media availability.
-Composite authorization is still checked using the retained allocation before
-returning NotFound. Unknown keys and missing/corrupt journals are **Unavailable**,
-not evidence of successful cleanup. GetCapacity stays zero and the slot is
-never rearmed. The facade must retain its finalizers on uncertain closure;
-once both providers confirm closure, normal backing resource cleanup can run.
+Fresh admission and data-plane Acquire/Validate/Renew require live, exact
+source pins. Committed observation and same-owner cleanup instead use positive
+retained metadata **plus actual media identity and independent cleanup proof**,
+even if the user deletes API objects. No source finalizers are necessary.
+Absence, elapsed TTL or an empty node receipt never releases ownership.
+Legacy committed holds retain observation/cleanup evidence; old owned-source
+objects cannot enroll under the new reader or be silently rewritten.
 
-### Executable native host member
+ReleaseNode and ReleaseAllocation are distinct:
 
-The same ACS driver process can now serve the cache-side native host member.
-It is **not** a Kata/guest adapter, does not own the origin disk, and does not
-install another daemon or modify DeviceProvider v1.
+- ReleaseNode requires exact owner/epoch and independently verified physical
+  cleanup. It does not delete sources or automatically close the allocation.
+- Controller `Release(ALLOCATION)` needs the exact returned allocation and
+  stable request ID, epoch 0 iff never acquired, otherwise the exact verified
+  released epoch; node/cleanup fields are empty. It is authorization closure,
+  never an LV operation. Preparing/uncertain acquisition is not cancellable
+  merely because no success reply arrived.
+- Exact committed closure replay and closed-key GetLease are history-only.
+  GetLease returns NotFound only for an authoritatively closed key; unknown/
+  corrupt state is Unavailable. No late provider Acquire/Reserve may rearm it.
+  After closure, normal underlying CSI may again operate on the external PVC;
+  that does not reopen provider authorization.
 
-- Set `ACS_HOST_CUSTODY=1` in addition to the dynamic enrollment/RPC opt-ins.
-  Keep the existing mTLS policy's `localCustody: true`. In this mode v1 uses
-  the in-process native member, **not** the legacy external `custody.sock`.
-  Configure before the first node Acquire; existing external/guest owners
-  cannot be converted into native host ownership.
-- Mount protected `/etc/acs-dmstack-enrollment/host.json`:
+**Remaining single-use limitation:** this canary admits one allocation and
+does not support a higher node epoch after verified ReleaseNode. Sources remain
+intact, but this adapter does **not** yet qualify normal Pod/StatefulSet restart
+reuse. Do not map ordinary ControllerUnpublish to allocation closure to conceal
+that limitation. Allocation closure belongs to composite PVC deletion.
 
-  ```json
-  {
-    "Socket": "/run/acs-dmstack/host-member.sock",
-    "StageRoot": "/var/lib/kubelet/plugins/kubernetes.io/csi/pv",
-    "PodsRoot": "/var/lib/kubelet/pods"
-  }
-  ```
+## Native host and paired Kata custody
 
-  The existing socket parent must be root-owned **0700**; the member creates a
-  **0600** Unix `SOCK_SEQPACKET` listener there. Give only the trusted facade
-  access to that private socket. A pre-existing socket is not hijacked/unlinked;
-  remove a stale socket only after independently establishing its process
-  stopped. Journal files must never be removed to recover the socket.
-- Run with real host PID visibility and the existing privileged ACS device,
-  sysfs and proc access. `/proc/1` must be the actual host init. Host stage/pod
-  roots must exist, be root-owned, and not group/world writable. The member
-  derives the actual boot ID and host mount namespace device/inode and pins
-  them durably. Caller JSON must match exactly. It also checks the socket
-  peer's real root UID and host PID namespace.
-- Linux **F_DUPFD_QUERY** must actually work. Startup/readiness probes the
-  running kernel with a private memfd; unsupported kernels fail closed, with
-  no inode/device-number substitute.
+For non-Kata, set `ACS_HOST_CUSTODY=1` and mount
+`/etc/acs-dmstack-enrollment/host.json`:
 
-The independent packet contract is `dmstack-host-ofd-v1`, with exact field
-compatibility fixture `testdata/host-member-v1.json`. Replies echo request
-identity/nonce and append `-ack` to the operation. Messages are bounded at
-64 KiB, parsed strictly (unknown/duplicate fields, extra grants and unexpected
-SCM_RIGHTS are rejected), with bounded connections and operation deadlines.
-The listener is registered as a manager runnable alongside the existing v1 RPC.
+```json
+{
+  "Socket": "/run/acs-dmstack/host-member.sock",
+  "StageRoot": "/var/lib/kubelet/plugins/kubernetes.io/csi/pv",
+  "PodsRoot": "/var/lib/kubelet/pods"
+}
+```
 
-`ready` checks the actual implementation, kernel and host binding, not a disk
-grant. `retain-host` requires the exact current ACQUIRED owner and immutable
-activation, independently selects the LV from the provider journal, verifies
-VG/LV/kernel identity, probes unused/exclusive, and retains its own original FD.
-The retained FD is ordinary O_RDWR, opened and verified **while the transient
-exclusive probe still exists**. Only the probe is then released; the retained
-original and durable provider gate remain continuously held. Keeping a block O_EXCL claim across handoff
-would conflict with the legitimate DM target claiming the same bdev. Durable
-native gates and the isolated host access policy protect this interval.
-The member sends only a duplicate of that original, never a caller path.
+The existing socket parent is root-owned 0700; the real listener is 0600
+SOCK_SEQPACKET. Root/host PID/proc/sysfs/device visibility and actual
+F_DUPFD_QUERY support are required; unknown capability is not success.
+Do not hijack an existing socket. Actual boot/mount identity is pinned and
+matched, not trusted from the caller. The node process serves both v1 and the
+private `dmstack-host-ofd-v1` member; no additional daemon or guest alias.
 
-O_EXCL is not a security fence against ordinary nonexclusive opens. Linux v6.6
-`blkdev_open` sets a holder only for O_EXCL; `blkdev_get_by_dev` claims only
-when a holder exists, and `bd_may_claim` tests holders rather than all openers
-([fops.c](https://github.com/torvalds/linux/blob/v6.6/block/fops.c),
-[bdev.c](https://github.com/torvalds/linux/blob/v6.6/block/bdev.c)).
-No forced formatter flags or patched formatter are introduced. A disposable
-guest must still qualify transient probe -> retained ordinary OFD -> the actual
-formatter and DM stack, with exact identity and normal-operation gate checks.
+The member opens/verifies retained **O_RDWR while a transient O_EXCL probe is
+still held**, then releases only the probe. Durable provider exclusion remains.
+O_EXCL is not a security fence against ordinary opens, and retaining its kernel
+claim would interfere with stock formatter/DM claims. No force flags, patched
+formatter, current-FD reopening or first-format service is used.
 
-`bind-host-current` requires the received FD to be the **same open file
-description** as the retained original, using the real kernel query.
-`check-host` revalidates the exact owner/activation/current and real device.
-The actual verified Acquire client certificate leaf is pinned in the provider
-journal. Every v1 node operation derives its peer from authenticated TLS;
-Validate requires that peer and the registered original/current OFD.
-No fingerprint supplied by the local client is accepted. Certificate rotation
-does not silently transfer an outstanding owner to another leaf.
+`retain-host`, `bind-host-current`, `check-host` require current ACQUIRED
+ownership, real LV identity and the same retained/current OFD. V1 identity is
+bound to the actual verified Acquire client certificate leaf, never caller
+fingerprint JSON. Disconnect keeps the original/hold; token-CAS prevents late
+disconnect from erasing a successor current. Lost originals are not recreated.
 
-Disconnect closes only that connection's token-matched current duplicate, not
-the original or hold. A late old disconnect cannot erase a newer binding.
-Facade reconnect gets the same original; provider process loss does **not**
-permit reconstructing it by path. Retained/cleanup state with a lost original
-is quarantined. Boot changes and unfinished opening intents fail closed.
+The cleanup-only retain/bind/check variants may attest that already-retained
+same owner/boot in ACQUIRED or HELD. They durably latch cleanup-only; no new
+use, lost-original reopen, Renew or Validate-held bypass. `finish-host` blocks
+future borrows, closes member originals, independently checks actual open counts
+(including queued SCM_RIGHTS), holders and mounts, then holds an exclusive probe
+through fsynced **native-host-teardown** evidence. Busy/unknown retains ownership.
+The trusted facade must additionally drain its own privileged executor and
+quarantine uncertain Create/format intents; a zero-reference snapshot does not
+prove no orphaned command can act later.
 
-The coordinated cleanup-only operations are `retain-host-cleanup`,
-`bind-host-cleanup`, and `check-host-cleanup`, with the same packet and FD counts
-as their normal counterparts. They require the exact already-retained original,
-same owner/activation/boot and ACQUIRED or HELD ownership. First cleanup retain
-durably latches cleanup-only; it does not close any FD or attest drained IO.
-Normal borrowing, binding, Validate and Renew then stay denied. Cleanup can
-observe/flush/drain the old owner only; it cannot Acquire, reopen a lost original,
-resume Stage/Publish or confer a successor grant. Readiness does not reject
-Held merely because renewal expired when that cleanup capability still exists.
+Kata keeps runtime-owned paired projection of origin/cache into the guest and
+guest dm-cache/filesystem assembly. Application Pods still see only the final
+filesystem. Preserve the existing external custody path and require exact
+**guest-clean AND host-unplugged** evidence for each raw provider device;
+native-host receipts are not interchangeable. This host member is not a Kata
+projection daemon. Bound/Reserve is not attach evidence; the origin provider
+and composite ControllerPublish must coordinate its exact normal attachment.
 
-`finish-host` is separate and terminal. It first durably prohibits further
-borrowing, then closes member-owned originals/currents. The real backend
-requires the actual LV open count to be zero (including borrowers and queued
-SCM_RIGHTS), no sysfs holders, no relevant mounts/raw block binds across visible
-host mount namespaces, and a verified exclusive probe held through receipt
-fsync. Busy, unreadable, changing or unknown state retains the closing hold.
-Only success produces immutable **`native-host-teardown`** evidence consumed
-by the same process's v1 ReleaseNode. Guest-clean/host-unplugged strings are
-never aliases for that evidence. ReleaseNode still precedes allocation closure;
-no member RPC removes or formats the LV.
+## Validation and preserved experiments
 
-This is not a general privileged-command supervisor: the trusted facade must
-drain/serialize its own executor before Finish, and quarantine uncertain Create
-or formatting intents after restart. A zero-reference snapshot does not prove
-that an orphaned privileged command cannot later create a mapper. The protocol
-does not claim automatic expiry IO fencing; expiration retains ownership.
-No untrusted root/raw device writers, independent journal restores or
-unregistered native storage processes may bypass this canary access boundary.
-
-The origin provider's actual member, facade graph lifecycle, fresh-origin
-authorization and **guest-only physical qualification** remain separate
-requirements. Legacy external/Kata modes still require the independent
-custodian described below; this native implementation does not supply guest
-cleanup attestations or relabel them.
-Never-acquired allocation cancellation needs no live custodian because it
-closes a positively recorded, unused authorization, not a node ownership claim.
-A deleting or unavailable source never implicitly releases ownership; operator
-recovery must preserve the journal rather than remove finalizers or reset it.
-
-Exact committed receipt observation and independently proved ReleaseNode may
-tolerate the original CR's deletion timestamp and node cordon, with all UID,
-claim/class/PV pins and actual media checks intact. Fresh Reserve admission,
-Acquire, Validate and Renew still reject those states. Missing/replaced source,
-deleting namespace/PVC/PV or deleting/replaced node remains fail-closed; normal
-backing finalizers keep those resources until allocation closure.
-
-### Focused validation
-
-Run on Linux with `TMPDIR` **and** `GOTMPDIR` on a private native Linux
-filesystem (Windows-mounted filesystems do not provide the required directory
-permissions/rename semantics). These commands passed for this integration:
+Use native Linux `TMPDIR` and `GOTMPDIR`. Root member tests inspect actual host
+namespaces but use only regular files/memfds and real SCM_RIGHTS, never raw
+host devices:
 
 ```sh
 go test -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... ./internal/csi/controller/... ./internal/csi/core/lvm/... ./internal/gc/... ./cmd/driver/...
 go build -buildvcs=false -p=2 ./cmd/driver ./cmd/manager
-go test -race -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... ./internal/csi/core/lvm/... ./cmd/driver/... -run 'TestHost|TestBacking|TestCanary|TestSeparate|TestCommittedSource|TestAllocationClosure|TestDynamic|TestAuthoritative|TestOrdinary|TestEnrollment|TestRPCResolve'
+go test -race -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... ./internal/csi/core/lvm/... ./cmd/driver/... -run 'TestHost|TestBacking|TestCanary|TestSeparate|TestRetainedExternal|TestExternalSources|TestAllocationClosure|TestDynamic|TestAuthoritative|TestOrdinary|TestEnrollment|TestRPCResolve'
 ```
 
-The build disables VCS stamping because Windows worktree metadata is not
-resolvable by Linux Git; it does not skip compilation. Separate-driver tests
-cover actual CreateVolume identity/topology, foreign VG/mapper refusal, managed
-tag refusal, old/default journal equivalence and exact custom SC/PV drivers.
+Windows worktree metadata requires `-buildvcs=false` when building under Linux.
+Software tests/model-gated guest formatter/DM evidence are not live-provider
+identity qualification. No deployment, source provisioning or live disk test
+is part of this change.
 
-Run the host-member fixture as root to inspect real host namespaces. It uses
-only regular files/memfds and actual SCM_RIGHTS; it never opens a block device.
-The tested kernel supported F_DUPFD_QUERY (the fixture did not skip). This
-covers retained-original reconnect, same-inode/wrong-OFD rejection, actual TLS
-leaf propagation, token-CAS disconnect, Held cleanup-only access, lost-original
-quarantine, busy borrowed-FD refusal and native receipt consumption. The real
-LV/DM/namespace cleanup backend still needs guest-only physical qualification.
-
-Tests exercise actual CSI handlers and authenticated generated RPC clients,
-with fake API inventory and mocked physical operations. They cover native
-admission before registration, both race winners, pending/crashed provisioning,
-partial enrollment, lost replies/restart, deleting-source receipt recovery,
-identity mismatches, uncertain acquisition, exact allocation closure, late
-Acquire/closure ordering, native DeleteVolume after closure, closed-key
-observation after source/media removal, and retired-slot rejection. They are not a live-device,
-host-custody, cloud or deployment qualification.
-
-## Ordinary ACS Block PV canary (no allocation)
-
-This mode uses **one already provisioned, disposable, normal ACS Block PV
-on its existing node**. It does not create, format, activate, erase, resize,
-rename, or remove that LV. It does not require the dedicated VG below.
-
-1. Verify the PV/PVC, `volumeMode: Block`, CSI driver, node, existing
-   `VG#pvc-<uuid>` handle, actual byte count, and VG/LV UUIDs independently.
-   The trusted operator attests the PV is disposable and not shared. The
-   canary accepts an active healthy normal or RAID0 LV in a local `local-csi`
-   tagged VG; no tagged/quarantined LV, device path or pod annotation is
-   an enrollment. **Provision the PV but leave it unpublished and unconsumed.**
-   Do not stage or publish the backing PVC to a helper, app or other pod.
-   A kubelet bind of a raw block inode can remain even when LVM reports no
-   opener. If already published, complete normal unpublish/unstage and verify
-   the host is clear before attempting enrollment.
-2. Stop all ACS writers on **that node** during enrollment. Use this binary
-   offline with the same persistent `/csi-node` plugin-directory mount,
-   device inventory, `NODE_NAME`, `ACS_RAW_CACHE=1`, and administrator
-   privileges: `/local-csi-driver raw-cache enroll-block < enrollment.json`.
-   Do not run `raw-cache init`. Enrollment input is one object:
-
-   ```json
-   {
-     "NodeID": "worker-a",
-     "CompositeID": "canary-a",
-     "VolumeHandle": "containerstorage#pvc-00000000-0000-0000-0000-000000000001",
-     "VolumeMode": "Block",
-     "VGUUID": "<observed vg_uuid>",
-     "LVUUID": "<observed lv_uuid>",
-     "Generation": 1,
-     "Bytes": 1073741824
-   }
-   ```
-
-   The generation is pinned in the single-use journal, not written to LVM.
-   Use one incarnation only; do not remove/recreate the journal, replace
-   media, or restore either independently. Enrollment writes and syncs a
-   private sibling, publishes it with Linux `RENAME_NOREPLACE`, then syncs
-   the parent. A crash before publication may leave an ignored sibling. An
-   existing final directory, even an empty or corrupt one, is not repaired.
-   Use a local filesystem supporting these operations. Upgraded drivers pin the
-   plugin directory while running so enrollment cannot race an instance
-   that started without the guards. Older binaries do not participate.
-3. Restart only the protecting binary. Use the existing two RPC opt-ins,
-   node-specific mTLS endpoint, `localCustody: true`, exact node/composite
-   grants and independent custodian described below. The unmodified chart
-   still requires its configured host directories. An ordinary enrollment
-   selects the canary backend exclusively on that node: wire `provider` is
-   the **VG UUID**, `pool_id` is `acs-disposable-block`. `Reserve` resolves
-   and durably holds the enrolled LV **only for exactly its observed byte
-   count**. Advisory capacity is this single slot's size when available,
-   zero when known busy, and an error when unknown. Busy, size mismatch
-   and inconclusive first admission do not create a request binding or hold
-   (a failure syncing a dispatched commit still requires exact replay).
-   The opaque `resource_id` is `VG/LV`; preserve
-   case and the exact VG/LV UUIDs. No host paths are accepted from the RPC.
-4. `Acquire` checks node, allocation, generation, epoch, custodian enrollment,
-   no holders/opens and an exclusive identity-checked probe, without writing
-   media. Enrollment and first `Reserve` also check host PID 1's kubelet
-   raw publish mounts (standard `/var/lib/kubelet` layout and host PID
-   namespace required). Reserve keeps the verified exclusive FD open
-   through journal sync under the same lock as ACS teardown. This is not a
-   continuous kernel fence. **Before enrollment**, isolate the node from
-   other consumers: only the trusted custodian may grant future device
-   access. It must prevent *all* unauthorized opens, device-node copies,
-   alternate-namespace mounts and raw writers until handoff/teardown.
-   ACS does not keep an exclusive FD across RPCs. `Validate` requires
-   the actual open file description from the custodian. Losing liveness
-   does not free the volume.
-5. To release the node, the custodian must independently confirm **both**
-   `guest-clean` and `host-unplugged` for the *same* immutable receipt and
-   exact owner. The latter must exclude any further IO/reopen by that guest.
-   ACS rechecks the live identity and absence of holders and takes another
-   exclusive probe. It commits retirement without deactivation. Stale
-   receipts, uncertain inventory, unavailable custodian or open devices
-   leave ordinary teardown blocked. If resolution succeeded but no node
-   ever acquired, there is intentionally no automatic unlock.
-
-The same flock and fsynced journal serialize enrollment/resolve/hold with
-CSI unpublish, unstage, delete (including pre-delete unmount), recovery,
-expand, orphan/failover GC, quarantine, wipe reaper and pool cleanup. This
-driver's unstage is normally a no-op; it still cannot acknowledge unstage
-while held. A conflicting operation that wins *before* resolve durably
-retires the enrollment before invoking the mounter/LVM; resolving later is
-impossible even after restart. Once resolved, those operations fail until
-verified release. This is intentionally single-use, not a way to suspend
-and re-enable arbitrary PVCs. The version-3 journal stays in
-`/csi-node/disposable-block-hold` and is checked even when RPC is disabled.
-For unpublish with an unrelated handle, a missing target DM UUID alone
-is not permission to clean a block inode. ACS verifies the enrolled LV's
-live LVM and kernel identity and distinct device number against its journal,
-or requires durable retirement. Uncertain or conflicting evidence blocks
-cleanup; a successful unrelated cleanup does not change the enrolled hold.
-
-**No online downgrade** with an outstanding hold. Legacy binaries, external
-LVM/root writers, kubelet plugin-directory removal or replacement, and an
-untrusted custodian are outside this interlock. Quiesce and isolate before
-rollback; disabling a chart switch is not proof of guest cleanup. The guest
-agent, host hot-unplug implementation and custodian are not installed here.
-
-## Dedicated raw-cache pool (separate mode)
-
-This is the allocation portion of a raw cache provider, not a second PVC,
-CSI capability or attachment service. It supports administrator `init`,
-`reserve` and `inspect`, and optionally the DeviceProvider v1 reservation
-RPCs. By default none returns a device path, activates an LV or grants IO.
-
-## Opt in
-
-- Deploy a driver image containing these changes. Before upgrade, verify
-  that no StorageClass, static PV, RAID configuration or existing ordinary VG
-  uses the newly reserved name `acs-dmstack-raw-v1`.
-- For each participating node, provision a **dedicated, local, non-shared**
-  VG of that name with the sole tag `acs.dmstack.raw.pool.v1`. Use storage
-  excluded from ordinary disk provisioning and RAID setup. It must start
-  empty, with no other writers or automatic activation. The provider does
-  not discover disks, initialize PVs, create VGs or adopt existing LVs.
-- Pre-provision `/var/lib/acs-dmstack-raw` on the node: root-owned, mode
-  `0700`, on persistent local storage supporting `flock`, atomic rename and
-  directory fsync. Keep one directory for the lifetime of the pool. Do not
-  share, replace, clone or independently restore the directory or VG. The
-  dedicated VG UUID identifies this local provider instance. This is not a
-  cluster-wide composite ID or request ledger.
-- `rawCache.enabled: true` mounts that directory into the driver container
-  only and enables its root-only local administrative command. Nodes selected
-  by that DaemonSet must all have the directory. Enabling the value alone
-  neither initializes the journal nor allocates space. There is no Service,
-  socket, new credential, RBAC rule or workload-facing parameter.
-
-In the enabled driver container the command forms are:
-
-```text
-/local-csi-driver raw-cache init
-/local-csi-driver raw-cache reserve REQUEST_ID COMPOSITE_ID BYTES
-/local-csi-driver raw-cache inspect POOL_UUID LEASE_ID
-```
-
-`init` is a one-time bootstrap, **never** a journal repair procedure.
-Reserve writes a versioned request binding and an incarnation intent before
-issuing a single tagged, inactive, activation-skipped linear `lvcreate`.
-Space rounds up to whole extents. A positive result requires the real
-VG and LV inventory to agree with the ledger, including actual capacity,
-LV UUID, lease and generation tags. Compatible requests converge; a request
-key cannot change inputs, even after an uncertain command. After a lost
-reply, retry the same input. A visible matching intent can finish without a
-second create; an absent dispatched LV blocks the pool rather than risking a
-second allocation. Preserve evidence and escalate if this persists.
-
-Ledger access is serialized across local processes. Validation is linear in
-pool PVs, LVs and journal size; mutations rewrite and sync a snapshot. There
-is no polling loop, compaction or per-PVC API lookup. Use is limited to
-low-rate reservations. Retain the journal and extents indefinitely.
-
-## Facade wiring
-
-The gRPC service `dmstack.provider.v1.DeviceProvider` is registered only on
-a separate TLS 1.3 mutual-auth listener. No new method is registered on a CSI
-socket. The checked-in `v1` schema and generated Go bindings can be rebuilt
-with `sh internal/devicelease/v1/generate.sh` (libprotoc 3.12.4, pinned
-public Go plugins). No private Go dependency is required.
-
-1. Complete local pool bootstrap above. The wire `provider` is **the
-   dedicated VG UUID** (also `PoolUUID` in the operator receipt), and
-   `pool_id` is **`acs-dmstack-raw-v1`**. Do not assign multiple nodes the
-   same provider identity.
-2. Provision `/etc/acs-dmstack-provider` on each serving node. Protect it
-   from workload access and non-admin writes. Include `tls.crt` (server
-   certificate chain), `tls.key` (private server key), `client-ca.crt`
-   (dedicated client trust roots), and `policy.json`. Example policy:
-
-   ```json
-   {
-     "provider": "<dedicated VG UUID>",
-     "grants": [{
-       "uri": "spiffe://storage.example/facade/controller",
-       "nodeID": "worker-a",
-       "role": "controller",
-       "composites": ["example-composite"]
-     }]
-   }
-   ```
-
-   `nodeID` must match the driver's actual Kubernetes node. Match exactly
-   one URI SAN in the verified client leaf; do not rely on CN, headers or
-   client-supplied node identity. A controller can reserve and read; `node`
-   can only read. `composites` is an exact allowlist. Use `allComposites:
-   true` instead **only** for a principal trusted for the entire local pool.
-3. Set **both** `rawCache.enabled` and `rawCache.rpc.enabled` to `true`.
-   Port defaults to `9711` (`rawCache.rpc.port`). No Service, hostPort or
-   certificate controller is installed. Route the facade directly to the
-   specific provider pod, not a load-balanced set of node-local ledgers.
-   Configure a gRPC TLS target such as `worker-a-provider.example:9711`,
-   trusted server CA, matching server DNS SAN, and client cert/key with the
-   authorized URI. Restrict ingress to intended clients. Missing or invalid
-   identity files prevent listener startup; they never enable plaintext.
-   Replace certificates, trust roots or policy via a controlled pod restart;
-   there is no hot reload. Client chain expiration is checked per call.
-4. `GetCapacity` reports reservable linear extents from the reconciled
-   VG/PV/LV inventory. `Reserve` requires a nonempty stable request ID,
-   composite ID and positive byte count. Every replay is reauthorized.
-   `GetLease` returns a `RESERVED` lease only for a matching committed
-   receipt and current inventory. The resource ID is opaque, not a device
-   path. Unknown state is `UNAVAILABLE`, not `NOT_FOUND` or zero capacity.
-
-## Optional local handoff
-
-Set `"localCustody": true` in the node's RPC policy **only** with a separate
-trusted custodian at `/etc/acs-dmstack-provider/custody.sock`. No custodian
-is installed by ACS. Without one, no IO handoff or cleanup can succeed.
-Only the existing, authenticated `node` role for the exact node/composite may
-acquire, validate, renew or release its node claim. The allocation remains
-charged after release in the dedicated raw-pool and offline modes.
-The online dynamic domain additionally supports the irreversible authorization
-closure above; physical deletion is still never performed by a provider RPC,
-and allocation reuse remains unavailable in every mode.
-
-The custodian must control **all** raw access on this dedicated, non-shared
-node. Local root, arbitrary privileged pods, VG aliases/clones, externally
-modified device tables or untrusted code able to replace the socket invalidate
-this assumption. There is no cross-node fencing or dependency on a remote
-owner. Keep the node clock trustworthy. This is not a storage transport.
-
-ACS connects to the root-owned custodian process over `SOCK_SEQPACKET`
-(`SO_PEERCRED`), one bounded request per connection. Each request is a JSON
-object with `Version: 1`, a fresh hex `Nonce`, `Operation`, `Receipt` and
-`Owner`. The owner fields are `PoolUUID`, `CompositeID`, `LeaseID`,
-`ResourceID`, `StableDeviceID`, `NodeID`, `Generation` and `Epoch`.
-Reply with `{"Challenge": <exact request>, "Confirmed": true}` **only**
-after independently proving the following; never just echo a facade request:
-
-- `enrolled`: access is exclusively mediated by this custodian on this
-  node, for this LV incarnation and owner epoch; no prior writer can open
-  it. Before the first grant, prevent clients opening the mapping while
-  ACS activates, inspects and zeroes it.
-- `opened`: the authorized facade has the device exclusively open for this
-  owner. The challenge additionally carries `OpenedPeerSHA256`: 64 lowercase
-  hex characters hashing the verified RPC client's DER leaf certificate.
-  Bind the host's current-FD evidence to that exact peer, not just its URI
-  grant. Echo the field unchanged with the nonce and owner. A missing field
-  or a receipt for a different leaf (even with the same URI) is rejected.
-  ACS uses `custody.sock`; `/etc/acs-dmstack-provider/current-fd.sock` is a
-  separate host protocol. Include **one `SCM_RIGHTS` duplicate of that open description**,
-  retaining the original. ACS checks block type, dev_t, kernel DM UUID,
-  capacity and the enrolled generation against current LVM inventory and
-  `Validate.opened`. No device path from the caller is opened.
-- `closed`: independently resolve the supplied immutable receipt ID for
-  completed teardown of this exact owner. All its users, mappings and
-  descriptor copies are gone and access cannot reopen for that epoch.
-  Do not attach descriptors for `enrolled` or `closed`. The custodian
-  must not call back into the provider while it holds the local journal lock.
-
-The first grant takes the journal lock, persists the owner **before**
-activation, verifies the mapping, and zeroes and flushes the entire LV via
-an exclusive, identity-checked FD. This can take minutes and serializes
-other local provider operations. Later epochs on the same allocation do
-not wipe its data. Renew before the returned one-minute deadline; expiry
-retains the owner and never deactivates the mapping. A crash during first
-preparation intentionally strands that intent for operator reconciliation,
-rather than repeating a potentially destructive zero. A lost committed
-reply is replayable without activation or wiping.
-
-Node release also requires zero opens, no sysfs holders, a UUID-selected
-non-forced deactivation, matching inactive LV metadata and no matching
-kernel DM UUID. On ambiguity retain ownership. Retry the identical release
-after restoring evidence; replay of a committed release only acknowledges
-history, never touches a successor. Do not discard an uncertain journal.
-
-## Rollback
-
-The first admitted owner mutation upgrades the local journal to version 2.
-Fresh IDs rejected before an owner transition (for example a stale generation
-or epoch) are not journaled. Admission binds the ID and input in the same
-durable snapshot as the transition, before any activation or deactivation.
-Reservation-only binaries cannot read it. Turning off `localCustody` blocks
-new owner operations; it does not clean up existing owners or migrate the
-journal. Preserve the journal and assets, including for interrupted handoffs.
-
-CSI/GC protections remain active when `rawCache.enabled` is switched off.
-The directory is then unmounted, not erased. Roll out the protecting binary
-on all participating nodes **before** enabling reservations. Older binaries
-(including the local v0.4.1 release baseline) lack the reserved-VG guards,
-including on direct CSI handles and shutdown PV cleanup. **Do not roll a
-node back with provider media visible.** Disabling the chart switch is not
-a downgrade procedure. Preserve and isolate both media and journal first;
-there is no automatic migration or safe online downgrade/reclaim.
+The superseded owned-backing parser/tests/fixture and previous instructions are
+preserved under `archive/owned-backing-pvcs/` (noncompiled `.go.txt` sources).
+Earlier raw-pool/offline administrative experiments remain optional historical
+code, not prerequisites or references in the active external-source path.

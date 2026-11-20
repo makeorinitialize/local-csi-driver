@@ -80,12 +80,6 @@ func (r *canarySource) Resolve(context.Context, string, int64) (devicelease.Cand
 	}
 	return r.c, nil
 }
-func (r *canarySource) ResolveCommitted(context.Context, string, int64) (devicelease.Candidate, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.c, nil
-}
-
 func TestDynamicRPCReservedReceiptBeforeAttachment(t *testing.T) {
 	cfg := devicelease.DynamicConfig{NodeName: "n1", NodeUID: "node-uid", Namespace: "backing", NamespaceUID: "namespace-uid",
 		CacheClass: "cache", CacheClassUID: "class-uid", VolumeGroup: "containerstorage", PoolUUID: "vg-uuid", Bytes: 4096}
@@ -146,8 +140,8 @@ func TestDynamicRPCReservedReceiptBeforeAttachment(t *testing.T) {
 	source.mu.Lock()
 	source.c.CompositeUID = "replacement"
 	source.mu.Unlock()
-	if _, err := controller.GetLease(t.Context(), reserved.Allocation.Key); status.Code(err) != codes.Unavailable {
-		t.Fatal("receipt recovery adopted replaced source", err)
+	if got, err := controller.GetLease(t.Context(), reserved.Allocation.Key); err != nil || !proto.Equal(got, reserved) {
+		t.Fatal("observation did not preserve original committed identity", got, err)
 	}
 	closeRequest := &pb.ReleaseRequest{RequestId: "release-reserve-0", Allocation: reserved.Allocation,
 		Mode: pb.ReleaseMode_RELEASE_MODE_ALLOCATION}

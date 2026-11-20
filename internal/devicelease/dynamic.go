@@ -35,17 +35,11 @@ func (c DynamicConfig) valid() bool {
 // or a device path. Fingerprint binds the complete canonical backing journal.
 type Candidate struct {
 	CompositeID, CompositeUID, VolumeHandle, Fingerprint, RequestID string
+	Snapshot                                                        string `json:",omitempty"`
 }
 
 type CandidateReader interface {
 	Resolve(context.Context, string, int64) (Candidate, error)
-}
-
-// CommittedCandidateReader permits receipt recovery while the original CR is
-// deleting. It must still match every source identity; this never admits media
-// or authorizes a node acquisition.
-type CommittedCandidateReader interface {
-	ResolveCommitted(context.Context, string, int64) (Candidate, error)
 }
 
 type OrdinaryDiscoverer interface {
@@ -125,13 +119,12 @@ func (p *Provider) sourceCurrent(ctx context.Context, s *ledger, receiptOnly boo
 	if s.Dynamic.Admission || s.Dynamic.Source == nil {
 		return ErrUncertain
 	}
-	resolve := p.dynamic.reader.Resolve
 	if receiptOnly {
-		if reader, ok := p.dynamic.reader.(CommittedCandidateReader); ok {
-			resolve = reader.ResolveCommitted
-		}
+		// Positive, previously verified immutable evidence, not an inference
+		// from API absence. Actual media/owner checks still follow this.
+		return s.validateSourceSnapshot()
 	}
-	now, err := resolve(ctx, s.Canary.CompositeID, s.Canary.Bytes)
+	now, err := p.dynamic.reader.Resolve(ctx, s.Canary.CompositeID, s.Canary.Bytes)
 	if err != nil || now != *s.Dynamic.Source {
 		return errors.Join(ErrUncertain, err)
 	}
@@ -280,6 +273,9 @@ func (p *Provider) dynamicPhysical(id, uuid string, target *BlockTarget) error {
 			return err
 		}
 		d := s.Dynamic
+		if d.Closure != nil {
+			return nil // terminal history cannot admit another provider owner
+		}
 		keys := []string{}
 		if id == "pool" || p.inDomain(id) {
 			keys = append(keys, id)
@@ -340,9 +336,14 @@ func (p *Provider) BeginProvision(id string) (func(bool) error, error) {
 		return nil, err
 	}
 	token := hex.EncodeToString(key[:])
+	closed := false
 	err := withLedger(p.directory, func(s *ledger, save func() error) error {
 		if err := p.checkDynamic(s); err != nil {
 			return err
+		}
+		if s.Dynamic.Closure != nil {
+			closed = true
+			return nil
 		}
 		if s.Canary != nil && (id == s.Canary.VolumeHandle || id == mapperID(s.Canary.VolumeHandle)) {
 			return ErrHeld
@@ -352,6 +353,9 @@ func (p *Provider) BeginProvision(id string) (func(bool) error, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	if closed {
+		return noop, nil
 	}
 	return func(success bool) error {
 		if !success {
