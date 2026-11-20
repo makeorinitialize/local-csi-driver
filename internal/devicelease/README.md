@@ -188,19 +188,118 @@ not evidence of successful cleanup. GetCapacity stays zero and the slot is
 never rearmed. The facade must retain its finalizers on uncertain closure;
 once both providers confirm closure, normal backing resource cleanup can run.
 
-### Remaining host custody dependency
+### Executable native host member
 
-This completes provider-owned **reservation/enrollment**, not the host/Kata
-device handoff. The separately implemented, root-owned custodian described
-below must still exclude all unauthorized future opens, authenticate the
-actual FD holder, and prove guest cleanup **and** host hot-unplug/reopen
-exclusion before node release. ACS holds the FD through durable admission,
-not across RPCs. No receipt here substitutes for those host guarantees.
-Without that custodian, Acquire/Validate/ReleaseNode remain fail-closed.
+The same ACS driver process can now serve the cache-side native host member.
+It is **not** a Kata/guest adapter, does not own the origin disk, and does not
+install another daemon or modify DeviceProvider v1.
+
+- Set `ACS_HOST_CUSTODY=1` in addition to the dynamic enrollment/RPC opt-ins.
+  Keep the existing mTLS policy's `localCustody: true`. In this mode v1 uses
+  the in-process native member, **not** the legacy external `custody.sock`.
+  Configure before the first node Acquire; existing external/guest owners
+  cannot be converted into native host ownership.
+- Mount protected `/etc/acs-dmstack-enrollment/host.json`:
+
+  ```json
+  {
+    "Socket": "/run/acs-dmstack/host-member.sock",
+    "StageRoot": "/var/lib/kubelet/plugins/kubernetes.io/csi/pv",
+    "PodsRoot": "/var/lib/kubelet/pods"
+  }
+  ```
+
+  The existing socket parent must be root-owned **0700**; the member creates a
+  **0600** Unix `SOCK_SEQPACKET` listener there. Give only the trusted facade
+  access to that private socket. A pre-existing socket is not hijacked/unlinked;
+  remove a stale socket only after independently establishing its process
+  stopped. Journal files must never be removed to recover the socket.
+- Run with real host PID visibility and the existing privileged ACS device,
+  sysfs and proc access. `/proc/1` must be the actual host init. Host stage/pod
+  roots must exist, be root-owned, and not group/world writable. The member
+  derives the actual boot ID and host mount namespace device/inode and pins
+  them durably. Caller JSON must match exactly. It also checks the socket
+  peer's real root UID and host PID namespace.
+- Linux **F_DUPFD_QUERY** must actually work. Startup/readiness probes the
+  running kernel with a private memfd; unsupported kernels fail closed, with
+  no inode/device-number substitute.
+
+The independent packet contract is `dmstack-host-ofd-v1`, with exact field
+compatibility fixture `testdata/host-member-v1.json`. Replies echo request
+identity/nonce and append `-ack` to the operation. Messages are bounded at
+64 KiB, parsed strictly (unknown/duplicate fields, extra grants and unexpected
+SCM_RIGHTS are rejected), with bounded connections and operation deadlines.
+The listener is registered as a manager runnable alongside the existing v1 RPC.
+
+`ready` checks the actual implementation, kernel and host binding, not a disk
+grant. `retain-host` requires the exact current ACQUIRED owner and immutable
+activation, independently selects the LV from the provider journal, verifies
+VG/LV/kernel identity, probes unused/exclusive, and retains its own original FD.
+The retained FD is ordinary O_RDWR: keeping a block O_EXCL claim across handoff
+would conflict with the legitimate DM target claiming the same bdev. Durable
+native gates and the isolated host access policy protect this interval.
+The member sends only a duplicate of that original, never a caller path.
+
+`bind-host-current` requires the received FD to be the **same open file
+description** as the retained original, using the real kernel query.
+`check-host` revalidates the exact owner/activation/current and real device.
+The actual verified Acquire client certificate leaf is pinned in the provider
+journal. Every v1 node operation derives its peer from authenticated TLS;
+Validate requires that peer and the registered original/current OFD.
+No fingerprint supplied by the local client is accepted. Certificate rotation
+does not silently transfer an outstanding owner to another leaf.
+
+Disconnect closes only that connection's token-matched current duplicate, not
+the original or hold. A late old disconnect cannot erase a newer binding.
+Facade reconnect gets the same original; provider process loss does **not**
+permit reconstructing it by path. Retained/cleanup state with a lost original
+is quarantined. Boot changes and unfinished opening intents fail closed.
+
+The coordinated cleanup-only operations are `retain-host-cleanup`,
+`bind-host-cleanup`, and `check-host-cleanup`, with the same packet and FD counts
+as their normal counterparts. They require the exact already-retained original,
+same owner/activation/boot and ACQUIRED or HELD ownership. First cleanup retain
+durably latches cleanup-only; it does not close any FD or attest drained IO.
+Normal borrowing, binding, Validate and Renew then stay denied. Cleanup can
+observe/flush/drain the old owner only; it cannot Acquire, reopen a lost original,
+resume Stage/Publish or confer a successor grant. Readiness does not reject
+Held merely because renewal expired when that cleanup capability still exists.
+
+`finish-host` is separate and terminal. It first durably prohibits further
+borrowing, then closes member-owned originals/currents. The real backend
+requires the actual LV open count to be zero (including borrowers and queued
+SCM_RIGHTS), no sysfs holders, no relevant mounts/raw block binds across visible
+host mount namespaces, and a verified exclusive probe held through receipt
+fsync. Busy, unreadable, changing or unknown state retains the closing hold.
+Only success produces immutable **`native-host-teardown`** evidence consumed
+by the same process's v1 ReleaseNode. Guest-clean/host-unplugged strings are
+never aliases for that evidence. ReleaseNode still precedes allocation closure;
+no member RPC removes or formats the LV.
+
+This is not a general privileged-command supervisor: the trusted facade must
+drain/serialize its own executor before Finish, and quarantine uncertain Create
+or formatting intents after restart. A zero-reference snapshot does not prove
+that an orphaned privileged command cannot later create a mapper. The protocol
+does not claim automatic expiry IO fencing; expiration retains ownership.
+No untrusted root/raw device writers, independent journal restores or
+unregistered native storage processes may bypass this canary access boundary.
+
+The origin provider's actual member, facade graph lifecycle, fresh-origin
+authorization and **guest-only physical qualification** remain separate
+requirements. Legacy external/Kata modes still require the independent
+custodian described below; this native implementation does not supply guest
+cleanup attestations or relabel them.
 Never-acquired allocation cancellation needs no live custodian because it
 closes a positively recorded, unused authorization, not a node ownership claim.
 A deleting or unavailable source never implicitly releases ownership; operator
 recovery must preserve the journal rather than remove finalizers or reset it.
+
+Exact committed receipt observation and independently proved ReleaseNode may
+tolerate the original CR's deletion timestamp and node cordon, with all UID,
+claim/class/PV pins and actual media checks intact. Fresh Reserve admission,
+Acquire, Validate and Renew still reject those states. Missing/replaced source,
+deleting namespace/PVC/PV or deleting/replaced node remains fail-closed; normal
+backing finalizers keep those resources until allocation closure.
 
 ### Focused validation
 
@@ -210,8 +309,16 @@ permissions/rename semantics). These commands passed for this integration:
 
 ```sh
 go test -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... ./internal/csi/controller/... ./internal/csi/core/lvm/... ./internal/gc/... ./cmd/driver/...
-go test -race -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... -run 'TestAllocationClosure|TestDynamic|TestAuthoritative|TestOrdinary|TestEnrollment|TestRPCResolve'
+go test -race -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... -run 'TestHost|TestCommittedSource|TestAllocationClosure|TestDynamic|TestAuthoritative|TestOrdinary|TestEnrollment|TestRPCResolve'
 ```
+
+Run the host-member fixture as root to inspect real host namespaces. It uses
+only regular files/memfds and actual SCM_RIGHTS; it never opens a block device.
+The tested kernel supported F_DUPFD_QUERY (the fixture did not skip). This
+covers retained-original reconnect, same-inode/wrong-OFD rejection, actual TLS
+leaf propagation, token-CAS disconnect, Held cleanup-only access, lost-original
+quarantine, busy borrowed-FD refusal and native receipt consumption. The real
+LV/DM/namespace cleanup backend still needs guest-only physical qualification.
 
 Tests exercise actual CSI handlers and authenticated generated RPC clients,
 with fake API inventory and mocked physical operations. They cover native

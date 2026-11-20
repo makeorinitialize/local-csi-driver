@@ -138,7 +138,7 @@ func (k KubernetesSource) resolve(ctx context.Context, composite string, n int64
 	}
 	if string(namespace.UID) != c.NamespaceUID || namespace.DeletionTimestamp != nil ||
 		namespace.Labels[backingPrefix+"backing-namespace"] != "v1" || len(namespace.OwnerReferences) != 0 ||
-		string(node.UID) != c.NodeUID || node.DeletionTimestamp != nil || node.Spec.Unschedulable {
+		string(node.UID) != c.NodeUID || node.DeletionTimestamp != nil || !receiptOnly && node.Spec.Unschedulable {
 		return fail()
 	}
 	for _, side := range []struct {

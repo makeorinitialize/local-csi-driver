@@ -100,11 +100,15 @@ func (o Owner) matches(r Reservation) bool {
 }
 
 func (p Provider) inventory(ctx context.Context, s *ledger, r Reservation) (Volume, error) {
+	return p.inventoryFor(ctx, s, r, false)
+}
+
+func (p Provider) inventoryFor(ctx context.Context, s *ledger, r Reservation, receiptOnly bool) (Volume, error) {
 	if p.isOrdinary() {
 		if err := p.checkCanary(s); err != nil {
 			return Volume{}, err
 		}
-		if err := p.sourceCurrent(ctx, s, false); err != nil {
+		if err := p.sourceCurrent(ctx, s, receiptOnly); err != nil {
 			return Volume{}, err
 		}
 		return observe(ctx, p.observer, *s.Canary)
@@ -165,6 +169,11 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 		if known && old != m {
 			return ErrConflict
 		}
+		if s.Dynamic != nil && s.Dynamic.HostBinding != nil && s.Dynamic.Host != nil {
+			if err := p.bindHostAuthority(s, a, o, false); err != nil {
+				return err
+			}
+		}
 		// Bind a fresh ID in the same snapshot as its first admitted
 		// transition, before any backend effect. Rejected keys cost no space.
 		record := func() {
@@ -186,7 +195,7 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 		if !o.matches(r) {
 			return ErrStale
 		}
-		v, err := p.inventory(ctx, s, r)
+		v, err := p.inventoryFor(ctx, s, r, m.Method == "release")
 		if err != nil {
 			return err
 		}
@@ -228,6 +237,9 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 			}
 			if s.Canary != nil {
 				if s.Dynamic != nil {
+					if err := p.bindHostAuthority(s, a, o, true); err != nil {
+						return err
+					}
 					// Cancellation must distinguish "never acquired" from a
 					// dispatched authority/probe with an unknown outcome.
 					*c = Claim{Phase: "preparing", Node: o.NodeID, Epoch: o.Epoch, Request: id}
@@ -313,7 +325,7 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 				return err
 			}
 			if s.Canary != nil {
-				v, err = p.inventory(ctx, s, r)
+				v, err = p.inventoryFor(ctx, s, r, true)
 				if err != nil {
 					return err
 				}
@@ -421,6 +433,9 @@ func (p Provider) ValidateOpen(ctx context.Context, a Authority, o Owner, size u
 		return ErrUncertain
 	}
 	return withLedger(p.directory, func(s *ledger, save func() error) error {
+		if err := p.bindHostAuthority(s, a, o, false); err != nil {
+			return err
+		}
 		r := s.Records[o.CompositeID]
 		if !o.valid() || !o.matches(r) || r.Claim == nil || r.Claim.Epoch != o.Epoch || r.Claim.Node != o.NodeID {
 			return ErrStale

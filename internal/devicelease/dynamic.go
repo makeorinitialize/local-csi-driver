@@ -52,8 +52,10 @@ type OrdinaryDiscoverer interface {
 }
 
 type dynamicState struct {
-	Config  DynamicConfig
-	Closure *allocationClosure `json:",omitempty"`
+	HostBinding *HostBinding `json:",omitempty"`
+	Host        *hostRecord  `json:",omitempty"`
+	Config      DynamicConfig
+	Closure     *allocationClosure `json:",omitempty"`
 	// Denied is append-only: a native command may survive process death.
 	// Pending provisions are cleared ONLY by that invocation after success.
 	Denied  map[string]bool

@@ -4,6 +4,7 @@
 package devicelease
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -18,6 +19,81 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestCommittedSourceCordonDeletionTeardown(t *testing.T) {
+	for _, staleSource := range []bool{false, true} {
+		t.Run(map[bool]string{false: "exact-prior-source", true: "replacement-node"}[staleSource], func(t *testing.T) {
+			p, source, k, _, composite := sourceProviderFixture(t)
+			r, err := p.ReserveInPool(t.Context(), source.Config.PoolUUID, "reserve", composite, source.Config.Bytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			o := Owner{PoolUUID: r.PoolUUID, CompositeID: r.CompositeID, LeaseID: r.LeaseID,
+				ResourceID: r.ResourceID(), StableDeviceID: r.StableDeviceID, Generation: r.Generation,
+				NodeID: source.Config.NodeName, Epoch: 1}
+			authority := proof{owner: o}
+			if _, err := p.Acquire(t.Context(), authority, "acquire", o, 0); err != nil {
+				t.Fatal(err)
+			}
+			var node corev1.Node
+			if err := k.Get(t.Context(), client.ObjectKey{Name: o.NodeID}, &node); err != nil {
+				t.Fatal(err)
+			}
+			node.Spec.Unschedulable = true
+			if staleSource {
+				node.UID = "replacement-node-uid"
+			}
+			if err := k.Update(t.Context(), &node); err != nil {
+				t.Fatal(err)
+			}
+			cr := &unstructured.Unstructured{}
+			cr.SetAPIVersion("storage.infinitydb.io/v1alpha1")
+			cr.SetKind("CompositeVolume")
+			if err := k.Get(t.Context(), client.ObjectKey{Name: composite}, cr); err != nil {
+				t.Fatal(err)
+			}
+			if err := k.Delete(t.Context(), cr); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := source.Resolve(t.Context(), composite, r.CapacityBytes); err == nil {
+				t.Fatal("new admission tolerated deletion/cordon")
+			}
+			if _, err := p.Renew(t.Context(), authority, "renew", o); err == nil {
+				t.Fatal("renew admitted on deleting source")
+			}
+			if _, err := p.Acquire(t.Context(), authority, "acquire", o, 0); err == nil {
+				t.Fatal("acquire replay admitted on deleting source")
+			}
+			if err := p.ValidateOpen(t.Context(), proof{owner: o, open: true}, o, uint64(r.CapacityBytes), 253, 9); err == nil {
+				t.Fatal("validation admitted on deleting source")
+			}
+			if staleSource {
+				if err := p.ReleaseNode(t.Context(), authority, "release", o, "receipt"); err == nil {
+					t.Fatal("teardown accepted replaced source UID")
+				}
+				if err := p.BeforePhysical(r.Handle, ""); !errors.Is(err, ErrHeld) {
+					t.Fatal("failed teardown dropped hold", err)
+				}
+				return
+			}
+			if _, err := p.Lookup(t.Context(), r.PoolUUID, r.LeaseID); err != nil {
+				t.Fatal("cordon/deletion blocked committed receipt", err)
+			}
+			stale := o
+			stale.Epoch++
+			if err := p.ReleaseNode(t.Context(), authority, "stale", stale, "receipt"); !errors.Is(err, ErrStale) {
+				t.Fatal("teardown accepted stale owner", err)
+			}
+			if err := p.ReleaseNode(t.Context(), authority, "release", o, "receipt"); err != nil {
+				t.Fatal("exact independently verified teardown was blocked", err)
+			}
+			if err := p.ReleaseAllocation(t.Context(), "close", Allocation{PoolUUID: r.PoolUUID, CompositeID: r.CompositeID,
+				LeaseID: r.LeaseID, ResourceID: r.ResourceID(), StableDeviceID: r.StableDeviceID, Generation: r.Generation}, o.Epoch); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func sourceFixture(t *testing.T) (KubernetesSource, *unstructured.Unstructured, []client.Object) {
 	t.Helper()

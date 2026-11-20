@@ -73,6 +73,7 @@ type reserveIntent struct {
 }
 
 type Provider struct {
+	host      *HostMember
 	dynamic   *dynamicProvider
 	ordinary  *Enrollment
 	observer  OrdinaryObserver
@@ -375,5 +376,8 @@ func (s *ledger) validate() error {
 	if err := s.validateClaims(); err != nil {
 		return err
 	}
-	return s.validateClosure()
+	if err := s.validateClosure(); err != nil {
+		return err
+	}
+	return s.validateHost()
 }

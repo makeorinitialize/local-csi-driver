@@ -305,8 +305,17 @@ func main() {
 	if err != nil {
 		logAndExit(err, "cannot verify ordinary Block hold journal")
 	}
+	host, err := hostMember(nodeName, ordinary, rawCacheRPCPort)
+	if err != nil {
+		logAndExit(err, "invalid native host custody configuration")
+	}
+	if host != nil {
+		if err := mgr.Add(host); err != nil {
+			logAndExit(err, "cannot register native host custody listener")
+		}
+	}
 	if rawCacheRPCPort != 0 {
-		listener, err := rawCacheListener(rawCacheRPCPort, nodeName, lvmMgr, ordinary)
+		listener, err := rawCacheListener(rawCacheRPCPort, nodeName, lvmMgr, ordinary, host)
 		if err != nil {
 			logAndExit(err, "invalid raw-cache RPC configuration")
 		}

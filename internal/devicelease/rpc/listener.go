@@ -104,7 +104,7 @@ func (p policy) authorize(node string) (grpc.UnaryServerInterceptor, error) {
 			if !p.LocalCustody {
 				return nil, blocked
 			}
-			if info.FullMethod == pb.DeviceProvider_Validate_FullMethodName {
+			if g.Role == "node" {
 				if len(chain[0].Raw) == 0 || len(t.State.PeerCertificates) == 0 || t.State.PeerCertificates[0] == nil ||
 					!bytes.Equal(chain[0].Raw, t.State.PeerCertificates[0].Raw) {
 					return nil, status.Error(codes.Unauthenticated, "verified client leaf required")
@@ -130,6 +130,17 @@ type Listener struct {
 }
 
 func New(address, directory, node string, db *devicelease.Provider) (*Listener, error) {
+	return newListener(address, directory, node, db, nil)
+}
+
+func NewHost(address, directory, node string, db *devicelease.Provider, member *devicelease.HostMember) (*Listener, error) {
+	if member == nil {
+		return nil, errors.New("host member required")
+	}
+	return newListener(address, directory, node, db, member)
+}
+
+func newListener(address, directory, node string, db *devicelease.Provider, member *devicelease.HostMember) (*Listener, error) {
 	cert, err := tls.LoadX509KeyPair(filepath.Join(directory, "tls.crt"), filepath.Join(directory, "tls.key"))
 	if err != nil {
 		return nil, err
@@ -170,6 +181,12 @@ func New(address, directory, node string, db *devicelease.Provider) (*Listener, 
 	}
 	if db.PoolID() == devicelease.OrdinaryPool && !p.LocalCustody {
 		return nil, errors.New("ordinary Block hold requires local custody")
+	}
+	if member != nil {
+		if !p.LocalCustody || db.PoolID() != devicelease.OrdinaryPool {
+			return nil, errors.New("native host member requires ordinary local custody")
+		}
+		authority = member
 	}
 	s := newServer(cert, roots, p.Provider, auth, db, authority)
 	return &Listener{address: address, server: s}, nil

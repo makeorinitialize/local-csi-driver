@@ -5,6 +5,8 @@ package rpc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -16,6 +18,48 @@ import (
 	"local-csi-driver/internal/devicelease"
 	pb "local-csi-driver/internal/devicelease/v1"
 )
+
+type capturedPeerAuthority struct {
+	*enrolled
+	seen chan [sha256.Size]byte
+}
+
+func (a *capturedPeerAuthority) ForPeer(peer [sha256.Size]byte) devicelease.Authority {
+	a.seen <- peer
+	return a.enrolled
+}
+
+func TestHostAuthorityReceivesVerifiedAcquireLeaf(t *testing.T) {
+	cfg := devicelease.DynamicConfig{NodeName: "n1", NodeUID: "node-uid", Namespace: "backing", NamespaceUID: "namespace-uid",
+		CacheClass: "cache", CacheClassUID: "class-uid", VolumeGroup: "containerstorage", PoolUUID: "vg-uuid", Bytes: 4096}
+	source := &canarySource{c: devicelease.Candidate{CompositeID: "one", CompositeUID: "cr-uid", RequestID: "reserve",
+		Fingerprint: "full-journal", VolumeHandle: "containerstorage#pvc-12345678-1234-1234-1234-123456789abc"}}
+	db, err := devicelease.OpenDynamic(filepath.Join(t.TempDir(), "peer"), cfg, source, canaryObservation{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := db.ReserveInPool(t.Context(), cfg.PoolUUID, "reserve", "one", cfg.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := &pb.Owner{Allocation: lease(r).Allocation, NodeId: "n1", OwnerEpoch: 1}
+	expected, err := owner(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &capturedPeerAuthority{enrolled: &enrolled{owner: expected}, seen: make(chan [sha256.Size]byte, 1)}
+	const node = "spiffe://test/node/n1"
+	clients, leaves := authenticatedTLSClients(t, policy{Provider: cfg.PoolUUID, LocalCustody: true,
+		Grants: []Grant{{URI: node, NodeID: "n1", Role: "node", Composites: []string{"one"}}}}, db, a)
+	c := clients(node)
+	if _, err := c.Acquire(t.Context(), &pb.AcquireRequest{RequestId: "acquire", Owner: o}); err != nil {
+		t.Fatal(err)
+	}
+	got := <-a.seen
+	if hex.EncodeToString(got[:]) != (*leaves)[0] {
+		t.Fatal("member peer was not independently obtained from verified mTLS")
+	}
+}
 
 func (canaryObservation) DiscoverOrdinary(_ context.Context, e devicelease.Enrollment) (devicelease.Enrollment, error) {
 	e.LVUUID = "observed-lv-uuid"
