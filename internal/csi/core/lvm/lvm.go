@@ -28,13 +28,9 @@ import (
 	"local-csi-driver/internal/pkg/probe"
 )
 
-const (
+var (
 	// DriverName as registered with Kubernetes.
 	DriverName = "localdisk.csi.acstor.io"
-
-	// VolumeGroupNameParam is the StorageClass parameter key for specifying
-	// a custom volume group name. If not specified, DefaultVolumeGroup is used.
-	VolumeGroupNameParam = "volumeGroup"
 
 	// DefaultVolumeGroup is the default volume group name used if no
 	// VolumeGroupNameParam is specified in the volume create request.
@@ -47,6 +43,11 @@ const (
 	// TopologyKey is the expected key used in the volume request to specify the
 	// node where the volume should be placed.
 	TopologyKey = "topology.localdisk.csi.acstor.io/node"
+)
+
+const (
+	// VolumeGroupNameParam selects a VG within this driver's ownership scope.
+	VolumeGroupNameParam = "volumeGroup"
 
 	// Raid0LvType is the logical volume type for raid0.
 	raid0LvType = "raid0"
@@ -194,12 +195,21 @@ type Option func(*LVM)
 
 func WithOrdinaryHold(p *devicelease.Provider) Option { return func(l *LVM) { l.ordinary = p } }
 func (l *LVM) BeforePhysical(id, uuid string) error {
+	if err := checkCanaryTarget(id); err != nil {
+		return err
+	}
 	return holdError(l.ordinary.BeforePhysical(id, uuid))
 }
 func (l *LVM) BeforeUnpublish(id, path string) error {
+	if err := checkCanaryTarget(id); err != nil {
+		return err
+	}
 	return holdError(l.ordinary.BeforeUnpublish(id, path))
 }
 func (l *LVM) BeforeStats(id, path string) error {
+	if err := checkCanaryTarget(id); err != nil {
+		return err
+	}
 	return holdError(l.ordinary.BeforeStats(id, path))
 }
 func holdError(err error) error {
@@ -298,6 +308,9 @@ func (l *LVM) GetDriverName() string {
 // GetVolumeName returns the logical volume name from the volume id. The volume
 // id is expected to be in the format <volume-group>#<logical-volume>.
 func (l *LVM) GetVolumeName(volumeId string) (string, error) {
+	if err := checkCanaryTarget(volumeId); err != nil {
+		return "", err
+	}
 	id, err := newIdFromString(volumeId)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse volume id: %w", err)
@@ -311,6 +324,9 @@ func (l *LVM) GetVolumeName(volumeId string) (string, error) {
 // If the volume group already exists or is created, it returns it. Otherwise it
 // returns an error.
 func (l *LVM) EnsureVolumeGroup(ctx context.Context, name string, devices []string) (*lvm.VolumeGroup, error) {
+	if canaryVolumeGroup != "" {
+		return nil, fmt.Errorf("canary pools must be independently pre-provisioned")
+	}
 	log := log.FromContext(ctx).WithValues("vg", name)
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/EnsureVolumeGroup", trace.WithAttributes(
 		attribute.String("vol.group", name),
@@ -424,6 +440,9 @@ func (l *LVM) provisionVolumeGroup(ctx context.Context, name string, devices []s
 // If all physical volumes exist or were created successfully, it returns them
 // as a list of device paths, otherwise it returns an error and an empty list.
 func (l *LVM) EnsurePhysicalVolumes(ctx context.Context, vgName string) ([]string, error) {
+	if canaryVolumeGroup != "" {
+		return nil, fmt.Errorf("automatic physical disk provisioning is disabled for canaries")
+	}
 	if err := l.ordinary.BeforeGroupMutation(vgName); err != nil {
 		return nil, holdError(err)
 	}
@@ -520,6 +539,9 @@ func (l *LVM) ensurePhysicalVolume(ctx context.Context, device string) (*lvm.Phy
 // If the volume already exists, it returns it. Otherwise it creates the
 // volume and returns it.
 func (l *LVM) EnsureVolume(ctx context.Context, volumeId string, capacity int64, limit int64, isMountOperation bool) (size int64, resultErr error) {
+	if err := checkCanaryTarget(volumeId); err != nil {
+		return 0, err
+	}
 	if isMountOperation {
 		if err := l.BeforePhysical(volumeId, ""); err != nil {
 			return 0, err
@@ -794,6 +816,9 @@ func (l *LVM) prepareExistingVolume(ctx context.Context, id *volumeId, lv *lvm.L
 // CSI operations. Instead, since the volumeId (lv name) is unique across
 // vgs, we can look it up from the lv.
 func (l *LVM) GetNodeDevicePath(volumeId string) (string, error) {
+	if err := checkCanaryTarget(volumeId); err != nil {
+		return "", err
+	}
 	id, err := newIdFromString(volumeId)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse volume id: %w", err)
@@ -803,6 +828,9 @@ func (l *LVM) GetNodeDevicePath(volumeId string) (string, error) {
 
 // Cleanup cleans up the LVM resources on the node.
 func (l *LVM) Cleanup(ctx context.Context) error {
+	if canaryVolumeGroup != "" {
+		return nil // never run broad VG/PV cleanup alongside the managed addon
+	}
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/Cleanup")
 	defer span.End()
 	log := log.FromContext(ctx)

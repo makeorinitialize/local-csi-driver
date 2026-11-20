@@ -8,9 +8,57 @@ step below. It imports the existing ordinary raw Block LV on authenticated
 The DeviceProvider wire API is unchanged. **Only one composite, one node,
 one backing namespace, one cache class, and one LV incarnation are supported.**
 
+### Separate CSI instance, never an addon replacement
+
+Online mode requires an independently registered CSI name, separate node and
+controller sockets, and its own persistent plugin/journal mount. The managed
+`localdisk.csi.acstor.io` instance is not replaced or reconfigured. Example
+bootstrap for a separate process (not a deployment performed by this code):
+
+```text
+ACS_DYNAMIC_BLOCK=1 ACS_RAW_CACHE=1 ACS_HOST_CUSTODY=1
+--driver-name=localdisk.dmstack.infinitydb.io
+--canary-volume-group=dmstack-canary
+--ordinary-journal-directory=/csi-canary/hold
+--csi-node-bind-address=unix:///csi-canary/node.sock
+--csi-controller-bind-address=unix:///csi-canary/controller.sock
+--raw-cache-rpc-port=9711
+--node-name=<exact canary node>
+```
+
+Mount `/csi-canary` from that driver's own persistent host plugin directory,
+not the managed addon's directory. Configure its separate node-driver-registrar
+to the corresponding host `.../plugins/<canary-driver-name>/node.sock`, with
+its own registration, CSIDriver object, RBAC and StorageClass. CSI identity,
+topology keys, capacity metadata and GC filters use the configured process
+name. The managed-addon webhook mode is not used.
+
+The existing private VG must have the exact tag
+`dmstack.csi.localdisk.dmstack.infinitydb.io` in this example, **without**
+`local-csi`. It must not be `containerstorage` or another driver's VG.
+Canary StorageClass `parameters.volumeGroup` must explicitly name this VG.
+Startup verifies its actual UUID and owner tag; the source reader requires the
+configured cache driver to equal the actual serving identity and exact SC/PV
+drivers. All foreign VG handles and mapper aliases are rejected. Automatic
+disk/VG creation, broad pool cleanup and ephemeral CSI lifecycle are disabled
+in the alias process; native PVC/LV reclamation remains scoped to its private
+VG. Never rely on a new CSI name alone to exclude the managed addon's LVM
+scanners. Qualify the installed addon version's tag/device exclusion before
+deployment; no such live qualification or addon modification is performed here.
+
+The canonical journal adds optional `originDriver` and `cacheDriver` after
+`cacheBytes`. Absent fields still mean the official defaults. Explicit identical
+defaults compare equally without rewriting old journal bytes; custom values
+are exact, lowercase DNS names, at most 63 characters, distinct and not the
+other role's official driver. Root `domain.json` pins `OriginDriver` and
+`CacheDriver` using these same effective names. This is separate from wire
+provider/pool IDs, which remain actual VG UUID / `acs-disposable-block`.
+There is no migration/relabeling of an old official-name allocation into the
+new domain, and no normalization of VG, PV, LV or Azure resource IDs.
+
 ### Setup contract (operator actions; nothing is deployed by this change)
 
-1. Use a dedicated, isolated canary node and an existing healthy ACS VG.
+1. Use a dedicated, isolated canary node and an existing healthy private VG.
    Record its actual VG UUID. The node must have no older/parallel ACS writers,
    surviving commands from an older driver, privileged workload access, or
    external LVM writers. Do not hot-enable this on a running unguarded driver.
@@ -20,8 +68,9 @@ one backing namespace, one cache class, and one LV incarnation are supported.**
    using the existing enrollment pin; old binaries without that pin are
    unsupported. Upgrading a populated node requires independently proven host
    quiescence, not merely observing that its old driver process exited.
-2. Keep the existing persistent, root-owned `/csi-node` mount. The driver
-   creates `/csi-node/disposable-block-hold` once, with a version-4 ledger.
+2. Keep the isolated persistent, root-owned plugin mount, for example
+   `/csi-canary`. The driver creates the configured journal directory
+   (`/csi-canary/hold` above) once, with a version-4 ledger.
    Do not pre-create that subdirectory. Existing offline/v3 journals are not
    upgraded; missing/corrupt journals, changed domain pins and flag-off startup
    against v4 fail closed. Never delete, reset, clone or independently restore
@@ -38,9 +87,11 @@ one backing namespace, one cache class, and one LV incarnation are supported.**
      "NamespaceUID": "<API namespace UID>",
      "CacheClass": "canary-acs-block",
      "CacheClassUID": "<API StorageClass UID>",
-     "VolumeGroup": "containerstorage",
+     "VolumeGroup": "dmstack-canary",
      "PoolUUID": "<actual existing VG UUID>",
-     "Bytes": 1073741824
+     "Bytes": 1073741824,
+     "OriginDriver": "disk.dmstack.infinitydb.io",
+     "CacheDriver": "localdisk.dmstack.infinitydb.io"
    }
    ```
 
@@ -235,10 +286,21 @@ The listener is registered as a manager runnable alongside the existing v1 RPC.
 grant. `retain-host` requires the exact current ACQUIRED owner and immutable
 activation, independently selects the LV from the provider journal, verifies
 VG/LV/kernel identity, probes unused/exclusive, and retains its own original FD.
-The retained FD is ordinary O_RDWR: keeping a block O_EXCL claim across handoff
+The retained FD is ordinary O_RDWR, opened and verified **while the transient
+exclusive probe still exists**. Only the probe is then released; the retained
+original and durable provider gate remain continuously held. Keeping a block O_EXCL claim across handoff
 would conflict with the legitimate DM target claiming the same bdev. Durable
 native gates and the isolated host access policy protect this interval.
 The member sends only a duplicate of that original, never a caller path.
+
+O_EXCL is not a security fence against ordinary nonexclusive opens. Linux v6.6
+`blkdev_open` sets a holder only for O_EXCL; `blkdev_get_by_dev` claims only
+when a holder exists, and `bd_may_claim` tests holders rather than all openers
+([fops.c](https://github.com/torvalds/linux/blob/v6.6/block/fops.c),
+[bdev.c](https://github.com/torvalds/linux/blob/v6.6/block/bdev.c)).
+No forced formatter flags or patched formatter are introduced. A disposable
+guest must still qualify transient probe -> retained ordinary OFD -> the actual
+formatter and DM stack, with exact identity and normal-operation gate checks.
 
 `bind-host-current` requires the received FD to be the **same open file
 description** as the retained original, using the real kernel query.
@@ -309,8 +371,14 @@ permissions/rename semantics). These commands passed for this integration:
 
 ```sh
 go test -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... ./internal/csi/controller/... ./internal/csi/core/lvm/... ./internal/gc/... ./cmd/driver/...
-go test -race -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... -run 'TestHost|TestCommittedSource|TestAllocationClosure|TestDynamic|TestAuthoritative|TestOrdinary|TestEnrollment|TestRPCResolve'
+go build -buildvcs=false -p=2 ./cmd/driver ./cmd/manager
+go test -race -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... ./internal/csi/core/lvm/... ./cmd/driver/... -run 'TestHost|TestBacking|TestCanary|TestSeparate|TestCommittedSource|TestAllocationClosure|TestDynamic|TestAuthoritative|TestOrdinary|TestEnrollment|TestRPCResolve'
 ```
+
+The build disables VCS stamping because Windows worktree metadata is not
+resolvable by Linux Git; it does not skip compilation. Separate-driver tests
+cover actual CreateVolume identity/topology, foreign VG/mapper refusal, managed
+tag refusal, old/default journal equivalence and exact custom SC/PV drivers.
 
 Run the host-member fixture as root to inspect real host namespaces. It uses
 only regular files/memfds and actual SCM_RIGHTS; it never opens a block device.

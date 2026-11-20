@@ -41,6 +41,8 @@ type backingConfig struct {
 	CacheStorageClass  string `json:"cacheStorageClass"`
 	OriginBytes        int64  `json:"originBytes"`
 	CacheBytes         int64  `json:"cacheBytes"`
+	OriginDriver       string `json:"originDriver,omitempty"`
+	CacheDriver        string `json:"cacheDriver,omitempty"`
 }
 type backingClaim struct {
 	Name     string                      `json:"name"`
@@ -112,7 +114,9 @@ func (k KubernetesSource) resolve(ctx context.Context, composite string, n int64
 		return fail()
 	}
 	cfg := j.Config
-	if cfg.Namespace != c.Namespace || cfg.NamespaceUID != c.NamespaceUID || cfg.NodeName != c.NodeName ||
+	if !validDrivers(cfg.OriginDriver, cfg.CacheDriver) ||
+		originDriver(cfg.OriginDriver) != c.OriginDriverName() || cacheDriver(cfg.CacheDriver) != c.CacheDriverName() ||
+		cfg.Namespace != c.Namespace || cfg.NamespaceUID != c.NamespaceUID || cfg.NodeName != c.NodeName ||
 		cfg.NodeUID != c.NodeUID || cfg.CacheStorageClass != c.CacheClass || j.Cache.ClassUID != c.CacheClassUID ||
 		cfg.CacheBytes != n || cfg.OriginBytes <= 0 || cfg.OriginBytes%512 != 0 ||
 		cfg.OriginStorageClass == "" || cfg.OriginStorageClass == cfg.CacheStorageClass {
@@ -146,8 +150,8 @@ func (k KubernetesSource) resolve(ctx context.Context, composite string, n int64
 		bytes               int64
 		pin                 backingClaim
 	}{
-		{"origin", cfg.OriginStorageClass, "disk.csi.azure.com", cfg.OriginBytes, j.Origin},
-		{"cache", cfg.CacheStorageClass, "localdisk.csi.acstor.io", cfg.CacheBytes, j.Cache},
+		{"origin", cfg.OriginStorageClass, originDriver(cfg.OriginDriver), cfg.OriginBytes, j.Origin},
+		{"cache", cfg.CacheStorageClass, cacheDriver(cfg.CacheDriver), cfg.CacheBytes, j.Cache},
 	} {
 		if err := k.checkBinding(ctx, j.Owner, &node, side.role, side.class, side.driver, side.bytes, side.pin); err != nil {
 			return Candidate{}, err
@@ -177,6 +181,14 @@ func (k KubernetesSource) resolve(ctx context.Context, composite string, n int64
 	if again.GetUID() != v.GetUID() || again.GetResourceVersion() != v.GetResourceVersion() ||
 		!receiptOnly && again.GetDeletionTimestamp() != nil {
 		return fail()
+	}
+	// Semantic default equivalence for fingerprints only; never rewrite the
+	// authoritative annotation or change the old omitted-field serialization.
+	if j.Config.OriginDriver == OfficialOriginDriver {
+		j.Config.OriginDriver = ""
+	}
+	if j.Config.CacheDriver == OfficialCacheDriver {
+		j.Config.CacheDriver = ""
 	}
 	b, _ := json.Marshal(j)
 	return Candidate{CompositeID: composite, CompositeUID: string(v.GetUID()), VolumeHandle: j.Cache.Handle,

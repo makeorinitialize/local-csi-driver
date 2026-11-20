@@ -274,7 +274,7 @@ func (l *LVM) List(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListV
 	entries := make([]*csi.ListVolumesResponse_Entry, 0)
 
 	for _, vg := range vgs {
-		if vg.Name == devicelease.Group {
+		if vg.Name == devicelease.Group || !canaryGroupAllowed(vg.Name) {
 			continue
 		}
 		log.V(2).Info("listing logical volumes from volume group", "vg", vg.Name)
@@ -382,6 +382,9 @@ func (l *LVM) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*cs
 
 // TODO(sc): use a cache.
 func (l *LVM) AvailableCapacity(ctx context.Context, vgName string) (int64, error) {
+	if !canaryGroupAllowed(vgName) {
+		return 0, nil
+	}
 	if !devicelease.OrdinaryTarget(vgName, "volume") {
 		return 0, nil // not a CSI pool
 	}
@@ -404,6 +407,9 @@ func (l *LVM) AvailableCapacity(ctx context.Context, vgName string) (int64, erro
 			attribute.Int64("vg.free", int64(vg.Free)),
 		))
 		return int64(vg.Free), nil
+	}
+	if canaryVolumeGroup != "" {
+		return 0, fmt.Errorf("canary VG is missing; automatic disk discovery is disabled")
 	}
 
 	// Otherwise, the volume group hasn't been created yet, so we can return the

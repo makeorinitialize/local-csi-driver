@@ -21,10 +21,12 @@ type DynamicConfig struct {
 	CacheClass, CacheClassUID                  string
 	VolumeGroup, PoolUUID                      string
 	Bytes                                      int64
+	OriginDriver                               string `json:",omitempty"`
+	CacheDriver                                string `json:",omitempty"`
 }
 
 func (c DynamicConfig) valid() bool {
-	return c.NodeName != "" && c.NodeUID != "" && c.Namespace != "" && c.Namespace != "default" &&
+	return validDrivers(c.OriginDriver, c.CacheDriver) && c.NodeName != "" && c.NodeUID != "" && c.Namespace != "" && c.Namespace != "default" &&
 		c.NamespaceUID != "" && c.CacheClass != "" && c.CacheClassUID != "" &&
 		c.VolumeGroup != "mapper" && OrdinaryTarget(c.VolumeGroup, "volume") && c.PoolUUID != "" && c.Bytes > 0 && c.Bytes%512 == 0
 }
@@ -107,7 +109,7 @@ func OpenDynamic(path string, c DynamicConfig, reader CandidateReader, b Ordinar
 func (p *Provider) isOrdinary() bool { return p.ordinary != nil || p.dynamic != nil }
 
 func (p *Provider) checkDynamic(s *ledger) error {
-	if s.Dynamic == nil || s.Dynamic.Config != p.dynamic.config {
+	if s.Dynamic == nil || !s.Dynamic.Config.same(p.dynamic.config) {
 		return ErrUncertain
 	}
 	return nil

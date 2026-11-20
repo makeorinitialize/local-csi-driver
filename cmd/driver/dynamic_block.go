@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/url"
@@ -18,6 +19,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	csiLVM "local-csi-driver/internal/csi/core/lvm"
 	"local-csi-driver/internal/devicelease"
 	"local-csi-driver/internal/devicelease/lvbackend"
 	lvmMgr "local-csi-driver/internal/pkg/lvm"
@@ -37,7 +39,7 @@ func protectedFile(path string) error {
 }
 
 func ordinaryProvider(node string, manager lvmMgr.Manager) (*devicelease.Provider, error) {
-	b := lvbackend.Backend{Manager: manager}
+	b := lvbackend.Backend{Manager: manager, DriverName: csiLVM.DriverName}
 	mode := os.Getenv("ACS_DYNAMIC_BLOCK")
 	if mode == "" {
 		return devicelease.OpenOrdinary(ordinaryDirectory, node, b)
@@ -57,8 +59,18 @@ func ordinaryProvider(node string, manager lvmMgr.Manager) (*devicelease.Provide
 		return nil, err
 	}
 	domain, err := devicelease.DecodeDynamicConfig(data)
-	if err != nil || domain.NodeName != node {
+	if err != nil || domain.NodeName != node || domain.CacheDriverName() != csiLVM.DriverName {
 		return nil, errors.New("invalid or wrong-node dynamic enrollment domain")
+	}
+	if csiLVM.DriverName != csiLVM.OfficialDriverName {
+		if domain.VolumeGroup != csiLVM.DefaultVolumeGroup {
+			return nil, errors.New("domain VG differs from private canary bootstrap")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := b.CheckOrdinaryPool(ctx, domain); err != nil {
+			return nil, err
+		}
 	}
 	// No in-cluster fallback, ambient credentials, exec plugins, auth plugins,
 	// insecure TLS, or proxy routing. The dedicated reader is not the manager

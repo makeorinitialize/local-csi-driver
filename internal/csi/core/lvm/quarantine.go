@@ -291,7 +291,7 @@ func ManagedVolumeGroups(ctx context.Context, lister VolumeGroupLister) ([]strin
 
 	names := make([]string, 0, len(vgs))
 	for _, vg := range vgs {
-		if vg.Name == devicelease.Group {
+		if vg.Name == devicelease.Group || !canaryGroupAllowed(vg.Name) {
 			continue
 		}
 		names = append(names, vg.Name)

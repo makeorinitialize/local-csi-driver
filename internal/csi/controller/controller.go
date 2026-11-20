@@ -417,7 +417,7 @@ func pvHasHostnameTopology(pv *corev1.PersistentVolume) bool {
 	}
 
 	// Import the topology key from the lvm package
-	const topologyKey = lvm.TopologyKey
+	topologyKey := lvm.TopologyKey
 
 	for _, term := range pv.Spec.NodeAffinity.Required.NodeSelectorTerms {
 		for _, expr := range term.MatchExpressions {

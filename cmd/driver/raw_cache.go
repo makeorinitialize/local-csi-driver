@@ -20,7 +20,9 @@ import (
 const ledgerDirectory = "/var/lib/acs-dmstack-raw"
 
 // The plugin directory is a persistent host mount even with rawCache disabled.
-const ordinaryDirectory = "/csi-node/disposable-block-hold"
+const defaultOrdinaryDirectory = "/csi-node/disposable-block-hold"
+
+var ordinaryDirectory = defaultOrdinaryDirectory
 
 func rawCacheListener(port int, node string, manager lvmMgr.Manager, ordinary *devicelease.Provider, host *devicelease.HostMember) (*rpc.Listener, error) {
 	if os.Getenv("ACS_RAW_CACHE") != "1" || port < 1 || port > 65535 {

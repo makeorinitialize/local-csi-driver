@@ -40,14 +40,8 @@ func (b Backend) InspectOrdinary(ctx context.Context, e devicelease.Enrollment) 
 	if !devicelease.OrdinaryTarget(vg, lv) || !lvmID.MatchString(e.VGUUID) || !lvmID.MatchString(e.LVUUID) {
 		return devicelease.Volume{}, devicelease.ErrUncertain
 	}
-	g, err := b.Manager.GetVolumeGroup(ctx, vg)
-	if err != nil {
+	if err := b.ordinaryGroup(ctx, vg, e.VGUUID); err != nil {
 		return devicelease.Volume{}, err
-	}
-	if g == nil || g.Name != vg || g.UUID != e.VGUUID || len(g.Attributes) != 6 || g.Attributes[0] != 'w' || g.Attributes[2:4] != "--" || g.Attributes[5] != '-' ||
-		bool(g.Partial) || bool(g.Shared) || bool(g.Clustered) || bool(g.Exported) || g.MissingPVCount != 0 ||
-		!slices.Contains(strings.Split(g.Tags, ","), "local-csi") {
-		return devicelease.Volume{}, devicelease.ErrUncertain
 	}
 	l, err := b.Manager.GetLogicalVolume(ctx, vg, lv)
 	if err != nil {
@@ -72,6 +66,32 @@ func (b Backend) InspectOrdinary(ctx context.Context, e devicelease.Enrollment) 
 		return devicelease.Volume{}, errors.Join(devicelease.ErrUncertain, err)
 	}
 	return v, nil
+}
+
+func (b Backend) CheckOrdinaryPool(ctx context.Context, c devicelease.DynamicConfig) error {
+	driver := b.DriverName
+	if driver == "" {
+		driver = devicelease.OfficialCacheDriver
+	}
+	if c.CacheDriverName() != driver || !devicelease.OrdinaryTarget(c.VolumeGroup, "volume") || !lvmID.MatchString(c.PoolUUID) {
+		return devicelease.ErrUncertain
+	}
+	return b.ordinaryGroup(ctx, c.VolumeGroup, c.PoolUUID)
+}
+
+func (b Backend) ordinaryGroup(ctx context.Context, vg, id string) error {
+	g, err := b.Manager.GetVolumeGroup(ctx, vg)
+	if err != nil {
+		return err
+	}
+	tag := devicelease.OrdinaryVGTag(b.DriverName)
+	if g == nil || g.Name != vg || g.UUID != id || len(g.Attributes) != 6 || g.Attributes[0] != 'w' || g.Attributes[2:4] != "--" || g.Attributes[5] != '-' ||
+		bool(g.Partial) || bool(g.Shared) || bool(g.Clustered) || bool(g.Exported) || g.MissingPVCount != 0 ||
+		!slices.Contains(strings.Split(g.Tags, ","), tag) ||
+		tag != "local-csi" && slices.Contains(strings.Split(g.Tags, ","), "local-csi") {
+		return devicelease.ErrUncertain
+	}
+	return nil
 }
 func deviceUUID(major, minor uint32) (string, error) {
 	const root = "/sys/dev/block"

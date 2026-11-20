@@ -14,7 +14,10 @@ import (
 	lvmMgr "local-csi-driver/internal/pkg/lvm"
 )
 
-type Backend struct{ Manager lvmMgr.Manager }
+type Backend struct {
+	Manager    lvmMgr.Manager
+	DriverName string
+}
 
 func (b Backend) Inspect(ctx context.Context) (devicelease.Pool, error) {
 	vg, err := b.Manager.GetVolumeGroup(ctx, devicelease.Group)

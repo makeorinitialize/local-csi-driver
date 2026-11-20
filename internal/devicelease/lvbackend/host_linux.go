@@ -21,27 +21,31 @@ func (b Backend) OpenHost(ctx context.Context, e devicelease.Enrollment, v devic
 	// Keeping a block O_EXCL claim across handoff would conflict with the
 	// legitimate DM target claiming this bdev. Probe unused/exclusive first,
 	// then retain an ordinary FD under the provider's durable native gate.
-	if err := b.WithExclusive(e, v, func() error { return nil }); err != nil {
-		return nil, err
-	}
 	vg, lv, _ := strings.Cut(e.VolumeHandle, "#")
 	if !devicelease.OrdinaryTarget(vg, lv) {
 		return nil, devicelease.ErrUncertain
 	}
-	fd, err := unix.Open("/dev/"+vg+"/"+lv, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	var retained *os.File
+	err := b.WithExclusive(e, v, func() error {
+		fd, err := unix.Open("/dev/"+vg+"/"+lv, unix.O_RDWR|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		retained = os.NewFile(uintptr(fd), "acs-retained-lv")
+		if err := b.VerifyHost(retained, e, v); err != nil {
+			return err
+		}
+		return ctx.Err()
+	})
 	if err != nil {
+		if retained != nil {
+			retained.Close()
+		}
 		return nil, err
 	}
-	f := os.NewFile(uintptr(fd), "acs-retained-lv")
-	if err := b.VerifyHost(f, e, v); err != nil {
-		f.Close()
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return f, nil
+	// Only the probe was released; this independently verified ordinary OFD
+	// was already open, and the durable exclusive-use gate never dropped.
+	return retained, nil
 }
 
 func (b Backend) VerifyHost(f *os.File, e devicelease.Enrollment, v devicelease.Volume) error {

@@ -76,6 +76,7 @@ func main() {
 		return
 	}
 	var nodeName string
+	var driverName, canaryVolumeGroup string
 	var podName string
 	var podUID string
 	var namespace string
@@ -106,6 +107,9 @@ func main() {
 	var diskModels string
 	var diskTypes string
 	flag.IntVar(&rawCacheRPCPort, "raw-cache-rpc-port", 0, "Dedicated mTLS DeviceProvider port; zero disables serving.")
+	flag.StringVar(&driverName, "driver-name", lvm.OfficialDriverName, "Actual CSI identity; online canary must use a separate registered name.")
+	flag.StringVar(&canaryVolumeGroup, "canary-volume-group", "", "Pre-provisioned exclusive VG for a separately registered canary.")
+	flag.StringVar(&ordinaryDirectory, "ordinary-journal-directory", defaultOrdinaryDirectory, "Persistent enrollment journal in this driver's own plugin mount.")
 	flag.StringVar(&nodeName, "node-name", "",
 		"The name of the node this agent is running on.")
 	flag.StringVar(&podName, "pod-name", "",
@@ -174,6 +178,9 @@ func main() {
 	version.Log(log)
 	if printVersionAndExit {
 		return
+	}
+	if err := configureCanaryBootstrap(driverName, canaryVolumeGroup, ordinaryDirectory, csiNodeAddr, csiControllerAddr, runAlongsideWebhook); err != nil {
+		logAndExit(err, "invalid exclusive canary bootstrap")
 	}
 
 	// Parent context will be closed on interrupt or sigterm. From this point,
