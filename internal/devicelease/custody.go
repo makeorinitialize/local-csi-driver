@@ -14,6 +14,13 @@ var (
 	ErrHeld  = errors.New("local ownership retained")
 )
 
+type HoldPolicy uint8
+
+const (
+	HoldPolicyUnspecified HoldPolicy = iota
+	HoldPolicyExplicitRelease
+)
+
 type Owner struct {
 	PoolUUID, CompositeID, LeaseID, ResourceID, StableDeviceID, NodeID string
 	Generation, Epoch                                                  uint64
@@ -53,6 +60,7 @@ type Authority interface {
 func (s *ledger) validateClaims() error {
 	for id, m := range s.Mutations {
 		if !validID(id) || s.Requests[id].CompositeID != "" || !m.Owner.valid() ||
+			s.HoldPolicy == HoldPolicyExplicitRelease && m.Method == "renew" ||
 			(m.Method != "acquire" && m.Method != "renew" && m.Method != "release") {
 			return ErrUncertain
 		}
@@ -61,6 +69,9 @@ func (s *ledger) validateClaims() error {
 		c := r.Claim
 		if c == nil {
 			continue
+		}
+		if r.HoldPolicy == HoldPolicyExplicitRelease && c.Deadline != 0 {
+			return ErrUncertain
 		}
 		if c.Epoch == 0 || r.StableDeviceID == "" {
 			return ErrUncertain
@@ -80,7 +91,7 @@ func (s *ledger) validateClaims() error {
 			}
 			if c.Phase == "preparing" && (m.Method != "acquire" || m.Done) ||
 				c.Phase == "closing" && (m.Method != "release" || m.Done) ||
-				(c.Phase == "acquired" || c.Phase == "held") && (c.Deadline <= 0 || !m.Done || m.Method == "release") {
+				(c.Phase == "acquired" || c.Phase == "held") && (r.HoldPolicy != HoldPolicyExplicitRelease && c.Deadline <= 0 || !m.Done || m.Method == "release") {
 				return ErrUncertain
 			}
 		default:
@@ -128,6 +139,15 @@ func (p Provider) Acquire(ctx context.Context, a Authority, id string, o Owner, 
 	return p.change(ctx, a, id, mutation{Method: "acquire", Owner: o, Previous: previous})
 }
 func (p Provider) Renew(ctx context.Context, a Authority, id string, o Owner) (Reservation, error) {
+	if p.dynamic != nil {
+		err := withLedger(p.directory, func(s *ledger, _ func() error) error {
+			if err := p.checkDynamic(s); err != nil {
+				return err
+			}
+			return ErrHeld
+		})
+		return Reservation{}, err
+	}
 	return p.change(ctx, a, id, mutation{Method: "renew", Owner: o})
 }
 func (p Provider) ReleaseNode(ctx context.Context, a Authority, id string, o Owner, receipt string) error {
@@ -204,7 +224,7 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 			c = &Claim{}
 			r.Claim = c
 		}
-		if c.Phase == "acquired" && time.Now().Unix() >= c.Deadline {
+		if r.HoldPolicy != HoldPolicyExplicitRelease && c.Phase == "acquired" && time.Now().Unix() >= c.Deadline {
 			c.Phase = "held"
 			if err := save(); err != nil {
 				return err
@@ -221,7 +241,7 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 			if !live(c, v) {
 				return ErrUncertain
 			}
-			if err := authorizeLive(a, o, c, save); err != nil {
+			if err := authorizeLive(a, o, r, save); err != nil {
 				return err
 			}
 			result = r
@@ -255,7 +275,10 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 				if err := withUnused(p.observer, *s.Canary, v, func() error { return nil }); err != nil {
 					return err
 				}
-				*c = Claim{Phase: "acquired", Node: o.NodeID, Epoch: o.Epoch, Request: id, Major: v.Major, Minor: v.Minor, Deadline: time.Now().Add(time.Minute).Unix()}
+				*c = Claim{Phase: "acquired", Node: o.NodeID, Epoch: o.Epoch, Request: id, Major: v.Major, Minor: v.Minor}
+				if r.HoldPolicy != HoldPolicyExplicitRelease {
+					c.Deadline = time.Now().Add(time.Minute).Unix()
+				}
 				s.Records[o.CompositeID] = r
 				break
 			}
@@ -310,7 +333,7 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 			if !live(c, v) {
 				return ErrUncertain
 			}
-			if err := authorizeLive(a, o, c, save); err != nil {
+			if err := authorizeLive(a, o, r, save); err != nil {
 				return err
 			}
 			c.Deadline = time.Now().Add(time.Minute).Unix()
@@ -390,11 +413,14 @@ func (p Provider) change(ctx context.Context, a Authority, id string, m mutation
 
 func live(c *Claim, v Volume) bool { return v.Active && c.Major == v.Major && c.Minor == v.Minor }
 
-func authorizeLive(a Authority, o Owner, c *Claim, save func() error) error {
+func authorizeLive(a Authority, o Owner, r Reservation, save func() error) error {
 	if err := a.Enrolled(o); err != nil {
 		return err
 	}
-	return beforeDeadline(c, save)
+	if r.HoldPolicy == HoldPolicyExplicitRelease {
+		return nil
+	}
+	return beforeDeadline(r.Claim, save)
 }
 
 func beforeDeadline(c *Claim, save func() error) error {
@@ -416,7 +442,7 @@ func snapshot(r Reservation, v Volume, save func() error) error {
 	if c.Phase == "preparing" || c.Phase == "closing" {
 		return ErrUncertain
 	}
-	if c.Phase == "acquired" && time.Now().Unix() >= c.Deadline {
+	if r.HoldPolicy != HoldPolicyExplicitRelease && c.Phase == "acquired" && time.Now().Unix() >= c.Deadline {
 		c.Phase = "held"
 		if err := save(); err != nil {
 			return err
@@ -433,6 +459,11 @@ func (p Provider) ValidateOpen(ctx context.Context, a Authority, o Owner, size u
 		return ErrUncertain
 	}
 	return withLedger(p.directory, func(s *ledger, save func() error) error {
+		if p.dynamic != nil {
+			if err := p.checkDynamic(s); err != nil {
+				return err
+			}
+		}
 		if err := p.bindHostAuthority(s, a, o, false); err != nil {
 			return err
 		}
@@ -444,7 +475,7 @@ func (p Provider) ValidateOpen(ctx context.Context, a Authority, o Owner, size u
 		if c.Phase != "acquired" {
 			return ErrHeld
 		}
-		if time.Now().Unix() >= c.Deadline {
+		if r.HoldPolicy != HoldPolicyExplicitRelease && time.Now().Unix() >= c.Deadline {
 			c.Phase = "held"
 			if err := save(); err != nil {
 				return err
@@ -460,6 +491,9 @@ func (p Provider) ValidateOpen(ctx context.Context, a Authority, o Owner, size u
 		}
 		if err := a.Opened(ctx, o, v); err != nil {
 			return err
+		}
+		if r.HoldPolicy == HoldPolicyExplicitRelease {
+			return nil
 		}
 		return beforeDeadline(c, save)
 	})

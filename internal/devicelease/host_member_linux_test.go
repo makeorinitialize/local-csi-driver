@@ -288,7 +288,8 @@ func TestHostMemberRetainsRealOFDAndVerifiesTerminalUse(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := withLedger(p.directory, func(s *ledger, save func() error) error {
-		s.Records[o.CompositeID].Claim.Deadline = time.Now().Add(-time.Minute).Unix()
+		// Held is explicit quarantine, never a consequence of clock passage.
+		s.Records[o.CompositeID].Claim.Phase = "held"
 		return save()
 	}); err != nil {
 		t.Fatal(err)

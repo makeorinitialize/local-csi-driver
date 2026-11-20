@@ -1,27 +1,85 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 syntax = "proto3";
+
 package dmstack.provider.v1;
+
 option go_package = "local-csi-driver/internal/devicelease/v1;providerv1";
 
+// Provider-authoritative allocation and exclusive node ownership. This is not
+// a device transport or physical fencing protocol. Authenticate and authorize
+// the caller for the operation, composite and node (including on replays).
+// IDs are nonempty opaque strings, compared exactly. Reject missing required
+// messages and unknown modes/states; never interpret defaults as permission.
+//
+// Mutations are serialized with durable state and a provider-wide request_id
+// ledger. A well-formed admitted key names ONE method + complete input;
+// changing either is ALREADY_EXISTS. An exact retry may retry a failed intent
+// but must never repeat a committed effect, even after restart or deletion.
+// Reserve replays return the current state of the same allocation (including
+// HELD). Acquire replays return the current snapshot only for the same
+// active owner (stale incarnation: ABORTED; quarantined owner: FAILED_PRECONDITION).
+// Release replays acknowledge history ONLY.
+//
+// Errors have no usable output: INVALID_ARGUMENT for malformed input,
+// NOT_FOUND for authoritatively absent lookup, ABORTED for stale identity/CAS,
+// FAILED_PRECONDITION for retained ownership or inadequate cleanup proof,
+// RESOURCE_EXHAUSTED for known insufficient allocatable capacity. If ownership,
+// capacity, cleanup, physical attachment or commit outcome is uncertain, return
+// UNAVAILABLE, never success/zero capacity/NOT_FOUND. Retain the allocation;
+// reconcile or retry the same request_id. A lost reply, cancellation or clock
+// advance never proves that an operation failed or an old writer stopped.
 service DeviceProvider {
+  // Advisory snapshot; confirmed exhaustion is success with zero bytes.
   rpc GetCapacity(Pool) returns (Capacity);
+  // Allocate >= capacity_bytes (positive), without attaching or granting IO.
+  // One live allocation per (provider, composite_volume_id); compatible new
+  // request IDs converge on it for identical pool and originally requested size.
+  // Conflicting live intent is ALREADY_EXISTS. A resource and its stable
+  // device identity cannot back multiple live allocations, including aliases.
   rpc Reserve(ReserveRequest) returns (Lease);
+  // New requests: RESERVED only. Compare previous_owner_epoch with the retained high-water
+  // mark and require a strictly greater owner_epoch. Confirm exclusive physical
+  // access through provider authority before granting; never preempt via TTL.
   rpc Acquire(AcquireRequest) returns (Lease);
+  // Read-only. Match current ACQUIRED owner and compare all OpenedDevice
+  // attributes obtained by the authenticated facade from the already-open
+  // exclusive device and its attestation to independent provider evidence.
+  // Neither echoing the Lease nor matching a path or dev_t alone is proof.
   rpc Validate(ValidateRequest) returns (ValidateResponse);
-  rpc Renew(RenewRequest) returns (Lease);
+  // Legacy timed-owner compatibility only. Unsupported for EXPLICIT_RELEASE:
+  // return FAILED_PRECONDITION without changing ownership or admission.
+  rpc Renew(RenewRequest) returns (Lease) { option deprecated = true; }
   rpc Release(ReleaseRequest) returns (ReleaseAck);
+  // Current authoritative state; a deleted allocation yields NOT_FOUND.
   rpc GetLease(LeaseKey) returns (Lease);
 }
-message Pool { string provider = 1; string pool_id = 2; }
-message Capacity { uint64 available_bytes = 1; uint64 max_allocation_bytes = 2; }
+
+// Opaque provider-selected capacity/topology domain (not a device path).
+message Pool {
+  string provider = 1;
+  string pool_id = 2;
+}
+
+message Capacity {
+  uint64 available_bytes = 1;      // Total reservable bytes in the pool.
+  uint64 max_allocation_bytes = 2; // Largest single reservation now possible.
+}
+
 message ReserveRequest {
   string request_id = 1;
   Pool pool = 2;
   string composite_volume_id = 3;
   uint64 capacity_bytes = 4;
 }
-message LeaseKey { string provider = 1; string lease_id = 2; }
+
+message LeaseKey {
+  string provider = 1;
+  string lease_id = 2; // Durable allocation incarnation, never reused.
+}
+
+// Immutable. Compare every field, not just lease_id. device_generation is
+// nonzero and strictly increases on reuse of the backing device; never wrap.
 message Allocation {
   LeaseKey key = 1;
   string composite_volume_id = 2;
@@ -29,26 +87,49 @@ message Allocation {
   string stable_device_id = 4;
   uint64 device_generation = 5;
 }
-message Owner { Allocation allocation = 1; string node_id = 2; uint64 owner_epoch = 3; }
+
+message Owner {
+  Allocation allocation = 1;
+  string node_id = 2;
+  uint64 owner_epoch = 3;
+}
+
 enum LeaseState {
   LEASE_STATE_UNSPECIFIED = 0;
-  LEASE_STATE_RESERVED = 1;
+  LEASE_STATE_RESERVED = 1; // No node access; capacity remains charged.
   LEASE_STATE_ACQUIRED = 2;
-  LEASE_STATE_HELD = 3;
+  LEASE_STATE_HELD = 3;     // Quarantined; owner retained, new IO not authorized.
 }
+
+enum HoldPolicy {
+  HOLD_POLICY_UNSPECIFIED = 0;
+  HOLD_POLICY_EXPLICIT_RELEASE = 1;
+}
+
 message Lease {
   Allocation allocation = 1;
   string pool_id = 2;
-  uint64 capacity_bytes = 3;
+  uint64 capacity_bytes = 3; // Actual allocation size.
   LeaseState state = 4;
-  string node_id = 5;
-  uint64 owner_epoch = 6;
-  int64 renew_by_unix_seconds = 7;
+  string node_id = 5;        // Empty only in RESERVED.
+  uint64 owner_epoch = 6;    // High-water mark, initially 0; never reset on unstage.
+  int64 renew_by_unix_seconds = 7; // Legacy deadline; MUST be zero for EXPLICIT_RELEASE.
+  // Advisory hints only, absent/default in RESERVED. Never open a caller path.
   string observed_device_path = 8;
   uint32 observed_major = 9;
   uint32 observed_minor = 10;
+  // Required even for RESERVED. Retain ownership until explicit verified
+  // release; time, disconnect and process exit never authorize reuse.
+  // Unspecified/timed owners cannot be upgraded by interpreting a zero deadline.
+  HoldPolicy hold_policy = 11;
 }
-message AcquireRequest { string request_id = 1; Owner owner = 2; uint64 previous_owner_epoch = 3; }
+
+message AcquireRequest {
+  string request_id = 1;
+  Owner owner = 2;
+  uint64 previous_owner_epoch = 3; // Zero means "never acquired", not a wildcard.
+}
+
 message OpenedDevice {
   string stable_device_id = 1;
   uint64 device_generation = 2;
@@ -56,20 +137,43 @@ message OpenedDevice {
   uint32 observed_major = 4;
   uint32 observed_minor = 5;
 }
-message ValidateRequest { Owner owner = 1; OpenedDevice opened = 2; }
+
+message ValidateRequest {
+  Owner owner = 1;
+  OpenedDevice opened = 2;
+}
+
 message ValidateResponse {}
-message RenewRequest { string request_id = 1; Owner owner = 2; }
+
+message RenewRequest {
+  string request_id = 1;
+  Owner owner = 2;
+}
+
 enum ReleaseMode {
   RELEASE_MODE_UNSPECIFIED = 0;
   RELEASE_MODE_NODE = 1;
   RELEASE_MODE_ALLOCATION = 2;
 }
+
 message ReleaseRequest {
   string request_id = 1;
   Allocation allocation = 2;
-  uint64 owner_epoch = 3;
+  uint64 owner_epoch = 3; // Expected current epoch for BOTH modes, including 0.
   ReleaseMode mode = 4;
+  // NODE: both required, exact ACQUIRED/HELD owner only. Independently
+  // authenticate/resolve the immutable receipt: it must attest completed
+  // teardown for the exact Allocation + node_id + owner_epoch. An opaque
+  // string, timeout, client assertion or absent mount is not proof.
+  // Confirm the prior owner can no longer issue IO before
+  // returning to RESERVED; retain high-water mark, capacity and allocation.
+  // ALLOCATION: both forbidden. Delete only a RESERVED allocation at the
+  // expected epoch. Provider owns reclaim, quarantine, wipe and reuse policy.
   string node_id = 5;
   string cleanup_receipt_id = 6;
 }
+
+// Only acknowledges this exact request, never evidence of current ownership,
+// absence, or reusable capacity. Exact committed replay is read-only, even
+// after a successor acquires or the backing device is reallocated.
 message ReleaseAck {}

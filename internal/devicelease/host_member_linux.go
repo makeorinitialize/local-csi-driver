@@ -338,9 +338,6 @@ func (h *HostMember) handle(ctx context.Context, token uint64, q HostPacket, inp
 		if record.Phase == "cleanup" {
 			return ErrHeld
 		}
-		if err := beforeDeadline(c, save); err != nil {
-			return err
-		}
 		v, err := h.db.inventory(ctx, s, r)
 		if err != nil || !live(c, v) {
 			return errors.Join(ErrUncertain, err)

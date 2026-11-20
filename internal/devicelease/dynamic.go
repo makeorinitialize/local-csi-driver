@@ -82,7 +82,7 @@ func OpenDynamic(path string, c DynamicConfig, reader CandidateReader, b Ordinar
 		}
 		defer parent.Close()
 		if err := publishEnrollment(parent, path, func(dir *os.File) error {
-			return saveLedger(dir, &ledger{Version: 4, PoolUUID: c.PoolUUID,
+			return saveLedger(dir, &ledger{Version: 5, HoldPolicy: HoldPolicyExplicitRelease, PoolUUID: c.PoolUUID,
 				Records: map[string]Reservation{}, Requests: map[string]reserveIntent{},
 				Dynamic: &dynamicState{Config: c, Denied: map[string]bool{}, Pending: map[string]string{}}})
 		}); err != nil {
@@ -103,7 +103,10 @@ func OpenDynamic(path string, c DynamicConfig, reader CandidateReader, b Ordinar
 func (p *Provider) isOrdinary() bool { return p.ordinary != nil || p.dynamic != nil }
 
 func (p *Provider) checkDynamic(s *ledger) error {
-	if s.Dynamic == nil || !s.Dynamic.Config.same(p.dynamic.config) {
+	// Legacy stores remain intact and protected; startup never upgrades a
+	// timed or unmarked authorization into durable ownership.
+	if s.Version != 5 || s.HoldPolicy != HoldPolicyExplicitRelease ||
+		s.Dynamic == nil || !s.Dynamic.Config.same(p.dynamic.config) {
 		return ErrUncertain
 	}
 	return nil
@@ -243,7 +246,8 @@ func (p *Provider) enroll(ctx context.Context, s *ledger, save func() error, req
 			return err
 		}
 		r := Reservation{Handle: e.VolumeHandle, PoolUUID: e.VGUUID, CompositeID: composite,
-			LeaseID: hex.EncodeToString(key[:]), StableDeviceID: e.LVUUID, Generation: e.Generation,
+			HoldPolicy: HoldPolicyExplicitRelease,
+			LeaseID:    hex.EncodeToString(key[:]), StableDeviceID: e.LVUUID, Generation: e.Generation,
 			RequestedBytes: n, CapacityBytes: n}
 		s.Records[composite], s.Requests[request] = r, reserveIntent{composite, n}
 		d.Admission = false

@@ -159,6 +159,7 @@ func lease(r devicelease.Reservation) *pb.Lease {
 		CompositeVolumeId: r.CompositeID, ResourceId: r.ResourceID(),
 		StableDeviceId: r.StableDeviceID, DeviceGeneration: r.Generation},
 		PoolId: devicelease.Group, CapacityBytes: uint64(r.CapacityBytes), State: pb.LeaseState_LEASE_STATE_RESERVED}
+	l.HoldPolicy = pb.HoldPolicy(r.HoldPolicy)
 	if r.Handle != "" {
 		l.PoolId = devicelease.OrdinaryPool
 	}

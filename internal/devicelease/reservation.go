@@ -43,7 +43,8 @@ type Volume struct {
 
 // Reservation has no device path. A reservation is never an IO grant.
 type Reservation struct {
-	Handle                                         string `json:",omitempty"`
+	HoldPolicy                                     HoldPolicy `json:",omitempty"`
+	Handle                                         string     `json:",omitempty"`
 	PoolUUID, CompositeID, LeaseID, StableDeviceID string
 	Generation                                     uint64
 	RequestedBytes, CapacityBytes                  int64
@@ -56,11 +57,12 @@ func (r Reservation) tags() []string {
 }
 
 type ledger struct {
-	Dynamic  *dynamicState `json:",omitempty"`
-	Canary   *Enrollment   `json:",omitempty"`
-	Retired  bool          `json:",omitempty"`
-	Version  int
-	PoolUUID string
+	HoldPolicy HoldPolicy    `json:",omitempty"`
+	Dynamic    *dynamicState `json:",omitempty"`
+	Canary     *Enrollment   `json:",omitempty"`
+	Retired    bool          `json:",omitempty"`
+	Version    int
+	PoolUUID   string
 	// No record or request key is ever removed in v1.
 	Records   map[string]Reservation // composite -> incarnation
 	Requests  map[string]reserveIntent
@@ -323,8 +325,15 @@ func matchTags(got, want []string) bool {
 }
 
 func (s *ledger) validate() error {
+	if s.Version == 5 {
+		if s.Dynamic == nil || s.HoldPolicy != HoldPolicyExplicitRelease {
+			return ErrUncertain
+		}
+	} else if s.HoldPolicy != HoldPolicyUnspecified {
+		return ErrUncertain
+	}
 	if d := s.Dynamic; d != nil {
-		if s.Version != 4 || !d.Config.valid() || s.PoolUUID != d.Config.PoolUUID || d.Denied == nil || d.Pending == nil ||
+		if (s.Version != 4 && s.Version != 5) || !d.Config.valid() || s.PoolUUID != d.Config.PoolUUID || d.Denied == nil || d.Pending == nil ||
 			(s.Canary == nil) != (d.Source == nil) || s.Canary == nil && (d.Admission || len(s.Records) != 0 || s.Retired) {
 			return ErrUncertain
 		}
@@ -333,12 +342,12 @@ func (s *ledger) validate() error {
 			s.Canary.Bytes != d.Config.Bytes || d.Admission != (len(s.Records) == 0)) {
 			return ErrUncertain
 		}
-	} else if s.Version == 4 {
+	} else if s.Version == 4 || s.Version == 5 {
 		return ErrUncertain
 	}
 	if s.Canary != nil {
 		e := s.Canary
-		if (s.Version != 3 && s.Version != 4) || !e.valid() || e.VGUUID != s.PoolUUID || len(s.Records) > 1 {
+		if (s.Version != 3 && s.Version != 4 && s.Version != 5) || !e.valid() || e.VGUUID != s.PoolUUID || len(s.Records) > 1 {
 			return ErrUncertain
 		}
 		for _, r := range s.Records {
@@ -363,6 +372,9 @@ func (s *ledger) validate() error {
 		intents[input] = true
 	}
 	for c, r := range s.Records {
+		if r.HoldPolicy != s.HoldPolicy {
+			return ErrUncertain
+		}
 		id, err := hex.DecodeString(r.LeaseID)
 		if !validID(c) || c != r.CompositeID || r.PoolUUID != s.PoolUUID || !intents[reserveIntent{c, r.RequestedBytes}] ||
 			err != nil || len(id) != 16 || hex.EncodeToString(id) != r.LeaseID || seen[r.LeaseID] ||

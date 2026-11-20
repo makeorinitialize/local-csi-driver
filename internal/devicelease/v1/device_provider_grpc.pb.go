@@ -34,13 +34,54 @@ const (
 // DeviceProviderClient is the client API for DeviceProvider service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Provider-authoritative allocation and exclusive node ownership. This is not
+// a device transport or physical fencing protocol. Authenticate and authorize
+// the caller for the operation, composite and node (including on replays).
+// IDs are nonempty opaque strings, compared exactly. Reject missing required
+// messages and unknown modes/states; never interpret defaults as permission.
+//
+// Mutations are serialized with durable state and a provider-wide request_id
+// ledger. A well-formed admitted key names ONE method + complete input;
+// changing either is ALREADY_EXISTS. An exact retry may retry a failed intent
+// but must never repeat a committed effect, even after restart or deletion.
+// Reserve replays return the current state of the same allocation (including
+// HELD). Acquire replays return the current snapshot only for the same
+// active owner (stale incarnation: ABORTED; quarantined owner: FAILED_PRECONDITION).
+// Release replays acknowledge history ONLY.
+//
+// Errors have no usable output: INVALID_ARGUMENT for malformed input,
+// NOT_FOUND for authoritatively absent lookup, ABORTED for stale identity/CAS,
+// FAILED_PRECONDITION for retained ownership or inadequate cleanup proof,
+// RESOURCE_EXHAUSTED for known insufficient allocatable capacity. If ownership,
+// capacity, cleanup, physical attachment or commit outcome is uncertain, return
+// UNAVAILABLE, never success/zero capacity/NOT_FOUND. Retain the allocation;
+// reconcile or retry the same request_id. A lost reply, cancellation or clock
+// advance never proves that an operation failed or an old writer stopped.
 type DeviceProviderClient interface {
+	// Advisory snapshot; confirmed exhaustion is success with zero bytes.
 	GetCapacity(ctx context.Context, in *Pool, opts ...grpc.CallOption) (*Capacity, error)
+	// Allocate >= capacity_bytes (positive), without attaching or granting IO.
+	// One live allocation per (provider, composite_volume_id); compatible new
+	// request IDs converge on it for identical pool and originally requested size.
+	// Conflicting live intent is ALREADY_EXISTS. A resource and its stable
+	// device identity cannot back multiple live allocations, including aliases.
 	Reserve(ctx context.Context, in *ReserveRequest, opts ...grpc.CallOption) (*Lease, error)
+	// New requests: RESERVED only. Compare previous_owner_epoch with the retained high-water
+	// mark and require a strictly greater owner_epoch. Confirm exclusive physical
+	// access through provider authority before granting; never preempt via TTL.
 	Acquire(ctx context.Context, in *AcquireRequest, opts ...grpc.CallOption) (*Lease, error)
+	// Read-only. Match current ACQUIRED owner and compare all OpenedDevice
+	// attributes obtained by the authenticated facade from the already-open
+	// exclusive device and its attestation to independent provider evidence.
+	// Neither echoing the Lease nor matching a path or dev_t alone is proof.
 	Validate(ctx context.Context, in *ValidateRequest, opts ...grpc.CallOption) (*ValidateResponse, error)
+	// Deprecated: Do not use.
+	// Legacy timed-owner compatibility only. Unsupported for EXPLICIT_RELEASE:
+	// return FAILED_PRECONDITION without changing ownership or admission.
 	Renew(ctx context.Context, in *RenewRequest, opts ...grpc.CallOption) (*Lease, error)
 	Release(ctx context.Context, in *ReleaseRequest, opts ...grpc.CallOption) (*ReleaseAck, error)
+	// Current authoritative state; a deleted allocation yields NOT_FOUND.
 	GetLease(ctx context.Context, in *LeaseKey, opts ...grpc.CallOption) (*Lease, error)
 }
 
@@ -92,6 +133,7 @@ func (c *deviceProviderClient) Validate(ctx context.Context, in *ValidateRequest
 	return out, nil
 }
 
+// Deprecated: Do not use.
 func (c *deviceProviderClient) Renew(ctx context.Context, in *RenewRequest, opts ...grpc.CallOption) (*Lease, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Lease)
@@ -125,13 +167,54 @@ func (c *deviceProviderClient) GetLease(ctx context.Context, in *LeaseKey, opts 
 // DeviceProviderServer is the server API for DeviceProvider service.
 // All implementations must embed UnimplementedDeviceProviderServer
 // for forward compatibility.
+//
+// Provider-authoritative allocation and exclusive node ownership. This is not
+// a device transport or physical fencing protocol. Authenticate and authorize
+// the caller for the operation, composite and node (including on replays).
+// IDs are nonempty opaque strings, compared exactly. Reject missing required
+// messages and unknown modes/states; never interpret defaults as permission.
+//
+// Mutations are serialized with durable state and a provider-wide request_id
+// ledger. A well-formed admitted key names ONE method + complete input;
+// changing either is ALREADY_EXISTS. An exact retry may retry a failed intent
+// but must never repeat a committed effect, even after restart or deletion.
+// Reserve replays return the current state of the same allocation (including
+// HELD). Acquire replays return the current snapshot only for the same
+// active owner (stale incarnation: ABORTED; quarantined owner: FAILED_PRECONDITION).
+// Release replays acknowledge history ONLY.
+//
+// Errors have no usable output: INVALID_ARGUMENT for malformed input,
+// NOT_FOUND for authoritatively absent lookup, ABORTED for stale identity/CAS,
+// FAILED_PRECONDITION for retained ownership or inadequate cleanup proof,
+// RESOURCE_EXHAUSTED for known insufficient allocatable capacity. If ownership,
+// capacity, cleanup, physical attachment or commit outcome is uncertain, return
+// UNAVAILABLE, never success/zero capacity/NOT_FOUND. Retain the allocation;
+// reconcile or retry the same request_id. A lost reply, cancellation or clock
+// advance never proves that an operation failed or an old writer stopped.
 type DeviceProviderServer interface {
+	// Advisory snapshot; confirmed exhaustion is success with zero bytes.
 	GetCapacity(context.Context, *Pool) (*Capacity, error)
+	// Allocate >= capacity_bytes (positive), without attaching or granting IO.
+	// One live allocation per (provider, composite_volume_id); compatible new
+	// request IDs converge on it for identical pool and originally requested size.
+	// Conflicting live intent is ALREADY_EXISTS. A resource and its stable
+	// device identity cannot back multiple live allocations, including aliases.
 	Reserve(context.Context, *ReserveRequest) (*Lease, error)
+	// New requests: RESERVED only. Compare previous_owner_epoch with the retained high-water
+	// mark and require a strictly greater owner_epoch. Confirm exclusive physical
+	// access through provider authority before granting; never preempt via TTL.
 	Acquire(context.Context, *AcquireRequest) (*Lease, error)
+	// Read-only. Match current ACQUIRED owner and compare all OpenedDevice
+	// attributes obtained by the authenticated facade from the already-open
+	// exclusive device and its attestation to independent provider evidence.
+	// Neither echoing the Lease nor matching a path or dev_t alone is proof.
 	Validate(context.Context, *ValidateRequest) (*ValidateResponse, error)
+	// Deprecated: Do not use.
+	// Legacy timed-owner compatibility only. Unsupported for EXPLICIT_RELEASE:
+	// return FAILED_PRECONDITION without changing ownership or admission.
 	Renew(context.Context, *RenewRequest) (*Lease, error)
 	Release(context.Context, *ReleaseRequest) (*ReleaseAck, error)
+	// Current authoritative state; a deleted allocation yields NOT_FOUND.
 	GetLease(context.Context, *LeaseKey) (*Lease, error)
 	mustEmbedUnimplementedDeviceProviderServer()
 }

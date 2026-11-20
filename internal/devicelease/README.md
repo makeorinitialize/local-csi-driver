@@ -125,13 +125,35 @@ newly held media. The candidate/admission intent is saved before probing;
 unknown outcomes remain held. Never reset/copy/restore the journal independently
 of its media. The persistent parent is pinned before any handlers start.
 
-Fresh admission and data-plane Acquire/Validate/Renew require live, exact
+Fresh admission and data-plane Acquire/Validate require live, exact
 source pins. Committed observation and same-owner cleanup instead use positive
 retained metadata **plus actual media identity and independent cleanup proof**,
 even if the user deletes API objects. No source finalizers are necessary.
 Absence, elapsed TTL or an empty node receipt never releases ownership.
-Legacy committed holds retain observation/cleanup evidence; old owned-source
-objects cannot enroll under the new reader or be silently rewritten.
+Every new external-source lease, including RESERVED, declares
+`HOLD_POLICY_EXPLICIT_RELEASE` and a zero `renew_by_unix_seconds`. Clock
+passage, disconnect and restart do not change ACQUIRED into HELD and never
+permit takeover or reclaim. No periodic supervisor or renewal is needed.
+`Renew` remains on the wire for legacy modes but returns FAILED_PRECONDITION
+in the active external-source domain without recording a mutation. HELD means
+quarantine/uncertainty, not missed renewal.
+
+The local ledger is version 5 with an explicit hold-policy discriminator,
+also checked against each reservation. Missing/unknown policy, mixed records
+or a timed explicit-release claim fail closed. Version 4 and earlier dynamic
+stores are never upgraded, reset or reclaimed: startup refuses them unchanged,
+including old RESERVED, ACQUIRED and HELD state. Keep them protected for
+operator investigation. Old binaries cannot read version 5 safely and must not
+be rolled back onto its persistent store. This local version does not change
+the external-source annotation schema. Legacy raw-pool/offline modes retain
+their original timed protocol and lifecycle.
+
+Deploy only with a facade that requires this explicit wire policy, including
+on RESERVED; protobuf tolerance of an unknown field is not interoperability
+with a timed facade. The canonical `HoldPolicy`, field 11 and deprecated
+`Renew` contract are shared with the facade. Regenerate local bindings with
+`sh internal/devicelease/v1/generate.sh` (protoc 3.12.4, protoc-gen-go 1.36.12,
+protoc-gen-go-grpc 1.5.1).
 
 ReleaseNode and ReleaseAllocation are distinct:
 
@@ -213,10 +235,15 @@ host devices:
 ```sh
 go test -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... ./internal/csi/controller/... ./internal/csi/core/lvm/... ./internal/gc/... ./cmd/driver/...
 go build -buildvcs=false -p=2 ./cmd/driver ./cmd/manager
-go test -race -p=2 -count=1 -timeout=120s ./internal/devicelease/... ./internal/csi/node/... ./internal/csi/core/lvm/... ./cmd/driver/... -run 'TestHost|TestBacking|TestCanary|TestSeparate|TestRetainedExternal|TestExternalSources|TestAllocationClosure|TestDynamic|TestAuthoritative|TestOrdinary|TestEnrollment|TestRPCResolve'
+go test -buildvcs=false -race -p=2 -count=1 -timeout=180s ./internal/devicelease/... ./internal/csi/node/... ./internal/csi/controller/... ./internal/csi/core/lvm/... ./internal/gc/... ./cmd/driver/...
 ```
 
 Windows worktree metadata requires `-buildvcs=false` when building under Linux.
+The authenticated dynamic RPC test advances a synthetic clock beyond the old
+lease lifetime, reopens the durable store, verifies the same owner, and proves
+native delete/unpublish remain blocked until verified node release and final
+allocation closure. Legacy and mixed-policy journals are tested byte-for-byte
+unchanged after rejected RPCs and native operations.
 Software tests/model-gated guest formatter/DM evidence are not live-provider
 identity qualification. No deployment, source provisioning or live disk test
 is part of this change.
