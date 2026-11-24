@@ -104,6 +104,9 @@ spec:
         - --volume-wipe-interval={{ .Values.cleanup.volumeWipe.interval }}
         - --volume-wipe-concurrency={{ .Values.cleanup.volumeWipe.concurrency }}
         - --run-alongside-webhook={{ .Values.webhook.hyperconverged.enabled | default false }}
+        {{- range $value := .Values.daemonset.extraArgs }}
+        - {{ $value | quote }}
+        {{- end }}
 
         - --disk-path-prefixes={{ join "," (.Values.diskSelection.addonPathPrefixes | default list) }}
         - --disk-models={{ join "," (.Values.diskSelection.addonModels | default list) }}

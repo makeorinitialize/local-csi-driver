@@ -35,6 +35,7 @@ image:
 
 # DaemonSet configuration.
 daemonset:
+  extraArgs: []
   # Pod selector labels for the DaemonSet. If empty, default labels are used.
   podSelector: {}
   # Update strategy for the DaemonSet.
