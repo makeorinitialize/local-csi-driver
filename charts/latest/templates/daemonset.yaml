@@ -74,6 +74,7 @@ spec:
       - name: driver
         args:
         - --node-name=$(NODE_NAME)
+        - --driver-name={{ .Values.driver.name }}
         {{- if $use.enabled }}
         - --device-use-config=/etc/acs-compositedisk-use/domain.json
         {{- end }}
@@ -281,7 +282,7 @@ spec:
       - name: csi-registrar
         args:
         - --csi-address=/csi-node/csi.sock
-        - --kubelet-registration-path=/var/lib/kubelet/plugins/localdisk.csi.acstor.io/csi.sock
+        - --kubelet-registration-path=/var/lib/kubelet/plugins/{{ .Values.driver.name }}/csi.sock
         - --http-endpoint=:{{ .Values.observability.nodeDriverRegistrar.http.port }}
         - --v={{ .Values.observability.nodeDriverRegistrar.log.level }}
         env:
@@ -358,7 +359,7 @@ spec:
           type: Directory
         name: device
       - hostPath:
-          path: /var/lib/kubelet/plugins/localdisk.csi.acstor.io/
+          path: /var/lib/kubelet/plugins/{{ .Values.driver.name }}/
           type: DirectoryOrCreate
         name: node-socket-dir
       - name: controller-socket-dir

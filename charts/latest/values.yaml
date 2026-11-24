@@ -1,6 +1,9 @@
 # Name used for creating resources.
 name: csi-local
 
+driver:
+  name: localdisk.csi.acstor.io
+
 # Container image configuration.
 image:
   # Registry prefix for default MCR sidecars and legacy '/' repositories.

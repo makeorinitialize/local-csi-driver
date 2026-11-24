@@ -92,7 +92,7 @@ rules:
   resources:
   - csidrivers
   resourceNames:
-  - localdisk.csi.acstor.io
+  - {{ .Values.driver.name }}
   verbs:
   - patch
   - update
