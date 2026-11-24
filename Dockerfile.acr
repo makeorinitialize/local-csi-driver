@@ -1,0 +1,26 @@
+FROM mcr.microsoft.com/oss/go/microsoft/golang:1.26-azurelinux3.0@sha256:129cab4502dd2554942c3d8ee8910bf32d7f9017371a3f72b23fe55decfb7dae AS builder
+WORKDIR /workspace
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ cmd/
+COPY internal/ internal/
+ARG VERSION=dev
+ARG GIT_COMMIT
+ARG BUILD_DATE
+ARG BUILD_ID
+RUN CGO_ENABLED=1 GOEXPERIMENT=systemcrypto GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags "-X local-csi-driver/internal/pkg/version.version=${VERSION} -X local-csi-driver/internal/pkg/version.gitCommit=${GIT_COMMIT} -X local-csi-driver/internal/pkg/version.buildDate=${BUILD_DATE} -X local-csi-driver/internal/pkg/version.buildId=${BUILD_ID}" \
+    -o /workspace/local-csi-driver ./cmd/driver
+
+FROM mcr.microsoft.com/azurelinux/base/core:3.0@sha256:bfb630450e9c3d7428d59f25ce6df95ba5634d664d96b06017aa56f87da5ec0e AS dependency-install
+RUN tdnf install -y --releasever 3.0 --installroot /staging \
+    e2fsprogs lvm2 openssl-libs openssl util-linux xfsprogs \
+    && tdnf clean all \
+    && rm -rf /staging/run /staging/var/log /staging/var/cache/tdnf
+
+FROM mcr.microsoft.com/azurelinux/distroless/minimal:3.0@sha256:bc4d9a4e0d3317999e235cb5895dde28bf766d25533ae8e6ba311bd6d253f996
+WORKDIR /
+COPY --from=builder /workspace/local-csi-driver .
+COPY --from=dependency-install /staging /
+ENV DM_DISABLE_UDEV=1
+ENTRYPOINT ["/local-csi-driver"]
