@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 
+	"local-csi-driver/internal/csi/core"
 	"local-csi-driver/internal/csi/core/lvm"
 	"local-csi-driver/internal/csi/mounter"
 	lvmMgr "local-csi-driver/internal/pkg/lvm"
@@ -36,22 +37,24 @@ type lvmVolumeManagerAdapter struct {
 	mounter    mounter.Interface
 }
 
-func (a *lvmVolumeManagerAdapter) BeforePhysical(id, uuid string) error {
-	return a.lvmCore.BeforePhysical(id, uuid)
+func (a *lvmVolumeManagerAdapter) BeginNative(ctx context.Context, method, id, group string) (context.Context, func(bool) error, error) {
+	return a.lvmCore.BeginNative(ctx, method, id, group)
 }
 
-func (a *lvmVolumeManagerAdapter) DeleteVolume(ctx context.Context, volumeID string) error {
+func (a *lvmVolumeManagerAdapter) DeleteVolume(ctx context.Context, volumeID string) (resultErr error) {
 	// Parse the volume ID to get volume group and logical volume names
 	// Volume ID format is: <volume-group>#<logical-volume>
 	vgName, lvName, err := parseVolumeID(volumeID)
 	if err != nil {
 		return fmt.Errorf("failed to parse volume ID %s: %w", volumeID, err)
 	}
+	ctx, finish, gateErr := a.BeginNative(ctx, "GCDeleteVolume", volumeID, "")
+	if gateErr != nil {
+		return gateErr
+	}
+	defer core.CompleteNative(finish, &resultErr)
 
 	if !a.lvmCore.IsVolumeWipeEnabled() {
-		if err := a.BeforePhysical(volumeID, ""); err != nil {
-			return err
-		}
 		err := a.lvmManager.RemoveLogicalVolume(ctx, lvmMgr.RemoveLVOptions{
 			Name: vgName + "/" + lvName,
 		})

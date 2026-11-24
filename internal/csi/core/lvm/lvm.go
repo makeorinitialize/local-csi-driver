@@ -14,15 +14,13 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/singleflight"
-	grpcCodes "google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"local-csi-driver/internal/csi/core"
-	"local-csi-driver/internal/devicelease"
+	"local-csi-driver/internal/deviceuse"
 	"local-csi-driver/internal/pkg/events"
 	"local-csi-driver/internal/pkg/lvm"
 	"local-csi-driver/internal/pkg/probe"
@@ -167,7 +165,7 @@ var (
 )
 
 type LVM struct {
-	ordinary          *devicelease.Provider
+	uses              *deviceuse.Domain
 	releaseNamespace  string
 	podName           string
 	nodeName          string
@@ -193,33 +191,20 @@ type LVM struct {
 // Option configures an LVM volume manager.
 type Option func(*LVM)
 
-func WithOrdinaryHold(p *devicelease.Provider) Option { return func(l *LVM) { l.ordinary = p } }
-func (l *LVM) BeforePhysical(id, uuid string) error {
-	if err := checkCanaryTarget(id); err != nil {
-		return err
+func WithDeviceUse(d *deviceuse.Domain) Option { return func(l *LVM) { l.uses = d } }
+func (l *LVM) BeginNative(ctx context.Context, method, id, group string) (context.Context, func(bool) error, error) {
+	if id != "" {
+		if err := checkCanaryTarget(id); err != nil {
+			return ctx, nil, err
+		}
 	}
-	return holdError(l.ordinary.BeforePhysical(id, uuid))
+	return l.uses.BeginNative(ctx, method, id, group)
 }
-func (l *LVM) BeforeUnpublish(id, path string) error {
+func (l *LVM) BeginPreparation(ctx context.Context, method, id, node string, block bool) (context.Context, func(bool) error, error) {
 	if err := checkCanaryTarget(id); err != nil {
-		return err
+		return ctx, nil, err
 	}
-	return holdError(l.ordinary.BeforeUnpublish(id, path))
-}
-func (l *LVM) BeforeStats(id, path string) error {
-	if err := checkCanaryTarget(id); err != nil {
-		return err
-	}
-	return holdError(l.ordinary.BeforeStats(id, path))
-}
-func holdError(err error) error {
-	if errors.Is(err, devicelease.ErrHeld) {
-		return status.Error(grpcCodes.FailedPrecondition, "ordinary Block volume is held")
-	}
-	if err != nil {
-		return status.Error(grpcCodes.Unavailable, "cannot verify ordinary Block hold")
-	}
-	return nil
+	return l.uses.BeginPreparation(ctx, method, id, node, block)
 }
 
 // WithVolumeWipeEnabled controls whether deleted volumes are quarantined and
@@ -323,10 +308,15 @@ func (l *LVM) GetVolumeName(volumeId string) (string, error) {
 //
 // If the volume group already exists or is created, it returns it. Otherwise it
 // returns an error.
-func (l *LVM) EnsureVolumeGroup(ctx context.Context, name string, devices []string) (*lvm.VolumeGroup, error) {
+func (l *LVM) EnsureVolumeGroup(ctx context.Context, name string, devices []string) (out *lvm.VolumeGroup, resultErr error) {
 	if canaryVolumeGroup != "" {
 		return nil, fmt.Errorf("canary pools must be independently pre-provisioned")
 	}
+	ctx, finish, gateErr := l.BeginNative(ctx, "EnsureVolumeGroup", "", name)
+	if gateErr != nil {
+		return nil, gateErr
+	}
+	defer core.CompleteNative(finish, &resultErr)
 	log := log.FromContext(ctx).WithValues("vg", name)
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/EnsureVolumeGroup", trace.WithAttributes(
 		attribute.String("vol.group", name),
@@ -337,7 +327,7 @@ func (l *LVM) EnsureVolumeGroup(ctx context.Context, name string, devices []stri
 		span.SetStatus(codes.Error, "volume group name is required")
 		return nil, fmt.Errorf("%w: volume group name is required", core.ErrInvalidArgument)
 	}
-	if !devicelease.OrdinaryTarget(name, "volume") {
+	if !deviceuse.ValidTarget(name, "volume") {
 		return nil, fmt.Errorf("%w: reserved or invalid volume group", core.ErrInvalidArgument)
 	}
 	if len(devices) == 0 {
@@ -395,9 +385,6 @@ func (l *LVM) provisionVolumeGroup(ctx context.Context, name string, devices []s
 	// immediately before CreateVolumeGroup and inside the per-volume-group
 	// singleflight, so cleanup can never race a concurrent create of the same
 	// volume group.
-	if err := l.ordinary.BeforeGroupMutation(name); err != nil {
-		return nil, holdError(err)
-	}
 	if err := l.lvm.RemoveStaleDeviceMapperNodes(ctx, name); err != nil {
 		log.Error(err, "failed to remove stale device-mapper nodes")
 		recorder.Eventf(corev1.EventTypeWarning, provisioningVolumeGroupFailed, "Failed to remove stale device-mapper nodes for volume group %s: %s", name, err)
@@ -439,13 +426,15 @@ func (l *LVM) provisionVolumeGroup(ctx context.Context, name string, devices []s
 //
 // If all physical volumes exist or were created successfully, it returns them
 // as a list of device paths, otherwise it returns an error and an empty list.
-func (l *LVM) EnsurePhysicalVolumes(ctx context.Context, vgName string) ([]string, error) {
+func (l *LVM) EnsurePhysicalVolumes(ctx context.Context, vgName string) (out []string, resultErr error) {
 	if canaryVolumeGroup != "" {
 		return nil, fmt.Errorf("automatic physical disk provisioning is disabled for canaries")
 	}
-	if err := l.ordinary.BeforeGroupMutation(vgName); err != nil {
-		return nil, holdError(err)
+	ctx, finish, gateErr := l.BeginNative(ctx, "EnsurePhysicalVolumes", "", vgName)
+	if gateErr != nil {
+		return nil, gateErr
 	}
+	defer core.CompleteNative(finish, &resultErr)
 	log := log.FromContext(ctx)
 	recorder := events.FromContext(ctx)
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/EnsurePhysicalVolumes")
@@ -542,16 +531,11 @@ func (l *LVM) EnsureVolume(ctx context.Context, volumeId string, capacity int64,
 	if err := checkCanaryTarget(volumeId); err != nil {
 		return 0, err
 	}
-	if isMountOperation {
-		if err := l.BeforePhysical(volumeId, ""); err != nil {
-			return 0, err
-		}
-	}
-	finish, err := l.ordinary.BeginProvision(volumeId)
+	ctx, finish, err := l.BeginPreparation(ctx, "EnsureVolume", volumeId, l.nodeName, true)
 	if err != nil {
-		return 0, holdError(err)
+		return 0, err
 	}
-	defer func() { resultErr = errors.Join(resultErr, holdError(finish(resultErr == nil))) }()
+	defer core.CompleteNative(finish, &resultErr)
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/EnsureVolume", trace.WithAttributes(
 		attribute.String("vol.id", volumeId),
 		attribute.Int64("vol.capacity", capacity),
@@ -753,9 +737,6 @@ func (l *LVM) prepareExistingVolume(ctx context.Context, id *volumeId, lv *lvm.L
 			// mechanism would otherwise create it: vgmknodes is synchronous,
 			// so if activation truly succeeded this closes the gap instead
 			// of narrowing it.
-			if err := l.ordinary.BeforeGroupMutation(id.VolumeGroup); err != nil {
-				return holdError(err)
-			}
 			if mkErr := l.lvm.MakeVolumeGroupDeviceNodes(ctx, lvm.MakeVGDeviceNodesOptions{
 				Name: id.VolumeGroup,
 			}); mkErr != nil {
@@ -827,10 +808,15 @@ func (l *LVM) GetNodeDevicePath(volumeId string) (string, error) {
 }
 
 // Cleanup cleans up the LVM resources on the node.
-func (l *LVM) Cleanup(ctx context.Context) error {
+func (l *LVM) Cleanup(ctx context.Context) (resultErr error) {
 	if canaryVolumeGroup != "" {
 		return nil // never run broad VG/PV cleanup alongside the managed addon
 	}
+	ctx, finish, gateErr := l.BeginNative(ctx, "Cleanup", "", "")
+	if gateErr != nil {
+		return gateErr
+	}
+	defer core.CompleteNative(finish, &resultErr)
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/Cleanup")
 	defer span.End()
 	log := log.FromContext(ctx)
@@ -855,7 +841,7 @@ func (l *LVM) Cleanup(ctx context.Context) error {
 	}
 
 	for _, vg := range volumeGroup {
-		if vg.Name == devicelease.Group {
+		if vg.Name == deviceuse.RetiredRawVG {
 			continue
 		}
 		if err := l.removeVolumeGroup(ctx, vg.Name); err != nil {
@@ -885,10 +871,12 @@ func (l *LVM) Cleanup(ctx context.Context) error {
 }
 
 // removeVolumeGroup removes the VG from the node.
-func (l *LVM) removeVolumeGroup(ctx context.Context, vgName string) error {
-	if err := l.ordinary.BeforeGroupRemoval(vgName); err != nil {
-		return err
+func (l *LVM) removeVolumeGroup(ctx context.Context, vgName string) (resultErr error) {
+	ctx, finish, gateErr := l.BeginNative(ctx, "RemoveVolumeGroup", "", vgName)
+	if gateErr != nil {
+		return gateErr
 	}
+	defer core.CompleteNative(finish, &resultErr)
 	// Check if the VG exists, if there is no VG, we get NotFound error.
 	if _, err := l.lvm.GetVolumeGroup(ctx, vgName); err != nil {
 		if errors.Is(err, lvm.ErrNotFound) {
@@ -909,7 +897,12 @@ func (l *LVM) removeVolumeGroup(ctx context.Context, vgName string) error {
 }
 
 // removePhysicalVolumes removes the PVs from the node.
-func (l *LVM) removePhysicalVolumes(ctx context.Context, devicePaths []string) error {
+func (l *LVM) removePhysicalVolumes(ctx context.Context, devicePaths []string) (resultErr error) {
+	ctx, finish, gateErr := l.BeginNative(ctx, "RemovePhysicalVolumes", "", "")
+	if gateErr != nil {
+		return gateErr
+	}
+	defer core.CompleteNative(finish, &resultErr)
 	pvs := map[string]struct{}{}
 	// lists all the available PVs
 	listResult, err := l.lvm.ListPhysicalVolumes(ctx, nil)
@@ -917,11 +910,8 @@ func (l *LVM) removePhysicalVolumes(ctx context.Context, devicePaths []string) e
 		return fmt.Errorf("failed to list physical volumes: %w", err)
 	}
 	for _, pv := range listResult {
-		if pv.VGName == devicelease.Group {
+		if pv.VGName == deviceuse.RetiredRawVG {
 			continue
-		}
-		if err := l.ordinary.BeforeGroupRemoval(pv.VGName); err != nil {
-			return err
 		}
 		pvs[pv.Name] = struct{}{}
 	}

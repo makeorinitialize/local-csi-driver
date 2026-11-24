@@ -59,7 +59,7 @@ func NewPVFailoverReconciler(
 }
 
 // Reconcile implements the controller-runtime Reconciler interface.
-func (r *PVFailoverReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PVFailoverReconciler) Reconcile(ctx context.Context, req ctrl.Request) (out ctrl.Result, resultErr error) {
 	log := log.FromContext(ctx).WithName("pv-failover-reconciler").WithValues("pv", req.Name)
 
 	log.V(4).Info("PV failover reconciler triggered")
@@ -121,9 +121,11 @@ func (r *PVFailoverReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			"Cleaning up LVM volume %s from node %s due to node annotation mismatch", volumeID, r.nodeID)
 
 		// Unmount the volume before deletion
-		if err := core.BeforePhysical(r.lvmManager, volumeID); err != nil {
-			return ctrl.Result{}, err
+		ctx, finish, gateErr := core.BeginPhysical(ctx, r.lvmManager, "FailoverCleanup", volumeID)
+		if gateErr != nil {
+			return ctrl.Result{}, gateErr
 		}
+		defer core.CompleteNative(finish, &resultErr)
 		if devicePath != "" {
 			log.V(2).Info("Unmounting volume before deletion", "devicePath", devicePath)
 			if err := r.lvmManager.UnmountVolume(ctx, devicePath); err != nil {

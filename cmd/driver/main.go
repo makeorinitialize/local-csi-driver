@@ -19,7 +19,6 @@ import (
 	"local-csi-driver/internal/csi/core/lvm"
 	"local-csi-driver/internal/csi/mounter"
 	"local-csi-driver/internal/csi/server"
-	"local-csi-driver/internal/devicelease"
 	"local-csi-driver/internal/gc"
 	"local-csi-driver/internal/pkg/block"
 	"local-csi-driver/internal/pkg/events"
@@ -68,13 +67,6 @@ func init() {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "raw-cache" {
-		if err := rawCache(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
 	var nodeName string
 	var driverName, canaryVolumeGroup string
 	var podName string
@@ -101,15 +93,14 @@ func main() {
 	var volumeWipeEnabled bool
 	var volumeWipeInterval time.Duration
 	var volumeWipeConcurrency int
-	var rawCacheRPCPort int
+	var deviceUseConfigPath string
 	var runAlongsideWebhook bool
 	var diskPathPrefixes string
 	var diskModels string
 	var diskTypes string
-	flag.IntVar(&rawCacheRPCPort, "raw-cache-rpc-port", 0, "Dedicated mTLS DeviceProvider port; zero disables serving.")
-	flag.StringVar(&driverName, "driver-name", lvm.OfficialDriverName, "Actual CSI identity; online canary must use a separate registered name.")
+	flag.StringVar(&deviceUseConfigPath, "device-use-config", "", "Protected configuration for the opt-in mTLS DeviceUse service and durable native gates.")
+	flag.StringVar(&driverName, "driver-name", lvm.OfficialDriverName, "Actual CSI identity; an isolated canary uses a separately registered name.")
 	flag.StringVar(&canaryVolumeGroup, "canary-volume-group", "", "Pre-provisioned exclusive VG for a separately registered canary.")
-	flag.StringVar(&ordinaryDirectory, "ordinary-journal-directory", defaultOrdinaryDirectory, "Persistent enrollment journal in this driver's own plugin mount.")
 	flag.StringVar(&nodeName, "node-name", "",
 		"The name of the node this agent is running on.")
 	flag.StringVar(&podName, "pod-name", "",
@@ -179,7 +170,7 @@ func main() {
 	if printVersionAndExit {
 		return
 	}
-	if err := configureCanaryBootstrap(driverName, canaryVolumeGroup, ordinaryDirectory, csiNodeAddr, csiControllerAddr, runAlongsideWebhook); err != nil {
+	if err := configureCanaryBootstrap(driverName, canaryVolumeGroup, deviceUseConfigPath, csiNodeAddr, csiControllerAddr, runAlongsideWebhook); err != nil {
 		logAndExit(err, "invalid exclusive canary bootstrap")
 	}
 
@@ -299,35 +290,13 @@ func main() {
 		logAndExit(fmt.Errorf("lvm is not supported on this node"), "lvm is not supported")
 	}
 
-	pinEnrollment := devicelease.PinEnrollment
-	if os.Getenv("ACS_DYNAMIC_BLOCK") != "" {
-		pinEnrollment = devicelease.PinDynamicEnrollment
-	}
-	unpin, err := pinEnrollment(ordinaryDirectory)
+	uses, listener, err := configureDeviceUse(deviceUseConfigPath, nodeName, lvmMgr)
 	if err != nil {
-		logAndExit(err, "ordinary Block enrollment not stable")
+		logAndExit(err, "invalid durable device-use configuration")
 	}
-	defer unpin()
-	ordinary, err := ordinaryProvider(nodeName, lvmMgr)
-	if err != nil {
-		logAndExit(err, "cannot verify ordinary Block hold journal")
-	}
-	host, err := hostMember(nodeName, ordinary, rawCacheRPCPort)
-	if err != nil {
-		logAndExit(err, "invalid native host custody configuration")
-	}
-	if host != nil {
-		if err := mgr.Add(host); err != nil {
-			logAndExit(err, "cannot register native host custody listener")
-		}
-	}
-	if rawCacheRPCPort != 0 {
-		listener, err := rawCacheListener(rawCacheRPCPort, nodeName, lvmMgr, ordinary, host)
-		if err != nil {
-			logAndExit(err, "invalid raw-cache RPC configuration")
-		}
+	if listener != nil {
 		if err := mgr.Add(listener); err != nil {
-			logAndExit(err, "cannot register raw-cache RPC listener")
+			logAndExit(err, "cannot register device-use listener")
 		}
 	}
 
@@ -344,7 +313,7 @@ func main() {
 		lvmMgr,
 		tp,
 		lvm.WithVolumeWipeEnabled(volumeWipeEnabled),
-		lvm.WithOrdinaryHold(ordinary),
+		lvm.WithDeviceUse(uses),
 	)
 	if err != nil {
 		logAndExit(err, "unable to create lvm volume client")

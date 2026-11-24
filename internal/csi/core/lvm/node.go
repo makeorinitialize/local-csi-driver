@@ -44,10 +44,12 @@ func (l *LVM) GetNodeAccessModes() []*csi.VolumeCapability_AccessMode {
 
 // NodeExpandVolume implements the csi.NodeServer interface.
 // It expands the logical volume with lvm.
-func (l *LVM) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	if err := l.BeforePhysical(req.GetVolumeId(), ""); err != nil {
-		return nil, err
+func (l *LVM) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (out *csi.NodeExpandVolumeResponse, resultErr error) {
+	ctx, finish, gateErr := l.BeginNative(ctx, "NodeExpandVolume", req.GetVolumeId(), "")
+	if gateErr != nil {
+		return nil, gateErr
 	}
+	defer core.CompleteNative(finish, &resultErr)
 	ctx, span := l.tracer.Start(ctx, "volume.lvm.csi/NodeExpandVolume")
 	defer span.End()
 

@@ -5,27 +5,26 @@ package main
 
 import (
 	"errors"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"local-csi-driver/internal/csi/core/lvm"
 )
 
-func configureCanaryBootstrap(name, group, journal, nodeSocket, controllerSocket string, webhook bool) error {
+func configureCanaryBootstrap(name, group, configPath, nodeSocket, controllerSocket string, webhook bool) error {
 	if name == lvm.OfficialDriverName {
-		if os.Getenv("ACS_DYNAMIC_BLOCK") == "1" {
-			return errors.New("online enrollment requires a separately registered canary CSI driver, not the managed addon")
-		}
 		return lvm.ConfigureCanary(name, group)
 	}
-	if os.Getenv("ACS_DYNAMIC_BLOCK") != "1" || os.Getenv("ACS_RAW_CACHE") != "1" || webhook {
-		return errors.New("separate canary requires explicit online opt-ins and no managed-addon webhook")
+	if configPath == "" || webhook {
+		return errors.New("separate canary requires explicit device-use configuration and no managed-addon webhook")
 	}
-	root := filepath.Dir(journal)
-	if !filepath.IsAbs(journal) || filepath.Clean(journal) != journal ||
-		root == "/" || root == filepath.Dir(defaultOrdinaryDirectory) {
-		return errors.New("canary journal needs its own absolute plugin directory, not /csi-node")
+	nodePath, ok := strings.CutPrefix(nodeSocket, "unix://")
+	if !ok {
+		return errors.New("canary requires an explicit node socket")
+	}
+	root := filepath.Dir(nodePath)
+	if root == "/" || root == "/csi-node" {
+		return errors.New("canary needs its own plugin directory, not /csi-node")
 	}
 	if nodeSocket == controllerSocket {
 		return errors.New("canary node/controller sockets must be distinct")
@@ -33,7 +32,7 @@ func configureCanaryBootstrap(name, group, journal, nodeSocket, controllerSocket
 	for _, address := range []string{nodeSocket, controllerSocket} {
 		path, ok := strings.CutPrefix(address, "unix://")
 		if !ok || !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Dir(path) != root {
-			return errors.New("canary CSI sockets must be explicit paths in the isolated journal parent")
+			return errors.New("canary CSI sockets must be explicit paths in the isolated plugin directory")
 		}
 	}
 	return lvm.ConfigureCanary(name, group)

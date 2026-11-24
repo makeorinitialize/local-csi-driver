@@ -267,10 +267,16 @@ func (r *Reaper) Reconcile(ctx context.Context) error {
 // once lvremove has run the extents may be reallocated at any time and can no
 // longer be reached, so a volume is only ever removed after it has been
 // zeroed in full.
-func (r *Reaper) wipe(ctx context.Context, lv lvm.LogicalVolume) error {
-	if err := r.core.BeforePhysical(lv.VGName+"#"+lv.Name, lv.UUID); err != nil {
-		return err
+func (r *Reaper) wipe(ctx context.Context, lv lvm.LogicalVolume) (resultErr error) {
+	ctx, finish, gateErr := r.core.BeginNative(ctx, "Wipe", lv.VGName+"#"+lv.Name, "")
+	if gateErr != nil {
+		return gateErr
 	}
+	defer func() {
+		if err := finish(resultErr == nil); err != nil {
+			resultErr = errors.Join(resultErr, err)
+		}
+	}()
 	ctx, span := r.core.tracer.Start(ctx, "volume.lvm.csi/Reaper.wipe", trace.WithAttributes(
 		attribute.String("vol.group", lv.VGName),
 		attribute.String("vol.name", lv.Name),

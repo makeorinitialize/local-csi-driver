@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package compositedisk.provider.v1;
+
+option go_package = "local-csi-driver/internal/deviceuse/usev1;usev1";
+
+enum UseState {
+  USE_STATE_UNSPECIFIED = 0;
+  USE_STATE_ACTIVE = 1;
+  USE_STATE_RELEASED = 2;
+}
+
+message SourceVolume {
+  string driver = 1;
+  string volume_handle = 2;
+  string pv_name = 3;
+  string pv_uid = 4;
+}
+
+message UseIdentity {
+  string use_id = 1;
+  string composite_id = 2;
+  string node_id = 3;
+  SourceVolume source = 4;
+}
+
+message AcquireUseRequest { UseIdentity identity = 1; }
+message GetUseRequest { UseIdentity identity = 1; }
+message ReleaseUseRequest { UseIdentity identity = 1; }
+
+message Use {
+  UseIdentity identity = 1;
+  UseState state = 2;
+}
+
+service DeviceUse {
+  rpc AcquireUse(AcquireUseRequest) returns (Use);
+  rpc GetUse(GetUseRequest) returns (Use);
+  rpc ReleaseUse(ReleaseUseRequest) returns (Use);
+}

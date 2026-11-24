@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	"local-csi-driver/internal/devicelease"
+	"local-csi-driver/internal/deviceuse"
 )
 
 const (
@@ -35,7 +35,7 @@ func newVolumeId(vg, lv string) (*volumeId, error) {
 	if len(lv) == 0 {
 		return nil, fmt.Errorf("logical volume name is empty")
 	}
-	if !devicelease.OrdinaryTarget(vg, lv) {
+	if !deviceuse.ValidTarget(vg, lv) {
 		return nil, fmt.Errorf("reserved or invalid logical volume target")
 	}
 	return &volumeId{

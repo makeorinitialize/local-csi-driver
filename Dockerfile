@@ -44,7 +44,7 @@ ARG LDFLAGS="\
 # CGO_ENABLED=1 is required to build the driver with FIPS support.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 GOEXPERIMENT=systemcrypto GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -v -ldflags "${LDFLAGS}" -o local-csi-driver cmd/driver/main.go
+    CGO_ENABLED=1 GOEXPERIMENT=systemcrypto GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -v -ldflags "${LDFLAGS}" -o local-csi-driver ./cmd/driver
 
 
 # Generate NOTICE.txt from dependency licenses. Built in parallel with `builder`.

@@ -71,7 +71,7 @@ func New(volume core.NodeInterface, nodeID, selectedNodeAnnotation, selectedInit
 	}
 }
 
-func (ns *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+func (ns *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (out *csi.NodePublishVolumeResponse, resultErr error) {
 	ctx, span := ns.tracer.Start(ctx, "csi.v1.Node/NodePublishVolume", trace.WithAttributes(
 		attribute.String("vol.id", req.GetVolumeId()),
 	))
@@ -108,9 +108,11 @@ func (ns *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVol
 	}
 
 	log := log.FromContext(ctx).WithName("NodePublishVolume").WithValues("volumeID", volumeID)
-	if err := core.BeforePhysical(ns.volume, volumeID); err != nil {
-		return nil, err
+	ctx, finish, gateErr := core.BeginPreparation(ctx, ns.volume, "NodePublishVolume", volumeID, ns.nodeID, req.GetVolumeCapability().GetBlock() != nil)
+	if gateErr != nil {
+		return nil, gateErr
 	}
+	defer core.CompleteNative(finish, &resultErr)
 
 	mountOptions := []string{"bind"}
 	if req.GetReadonly() {
@@ -167,7 +169,7 @@ func (ns *Server) NodePublishVolume(ctx context.Context, req *csi.NodePublishVol
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (ns *Server) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+func (ns *Server) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (out *csi.NodeUnpublishVolumeResponse, resultErr error) {
 	ctx, span := ns.tracer.Start(ctx, "csi.v1.Node/NodeUnpublishVolume", trace.WithAttributes(
 		attribute.String("vol.id", req.GetVolumeId()),
 	))
@@ -185,11 +187,11 @@ func (ns *Server) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublis
 		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
 	}
 	log := log.FromContext(ctx).WithName("NodeUnpublishVolume").WithValues("volumeID", volumeID)
-	if g, ok := ns.volume.(interface{ BeforeUnpublish(string, string) error }); ok {
-		if err := g.BeforeUnpublish(volumeID, targetPath); err != nil {
-			return nil, err
-		}
+	ctx, finish, gateErr := core.BeginPhysical(ctx, ns.volume, "NodeUnpublishVolume", volumeID)
+	if gateErr != nil {
+		return nil, gateErr
 	}
+	defer core.CompleteNative(finish, &resultErr)
 
 	log.V(2).Info("unmounting volume")
 
@@ -241,11 +243,6 @@ func (ns *Server) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolume
 		return nil, status.Error(codes.InvalidArgument, "volume path was empty")
 	}
 
-	if g, ok := ns.volume.(interface{ BeforeStats(string, string) error }); ok {
-		if err := g.BeforeStats(req.GetVolumeId(), req.GetVolumePath()); err != nil {
-			return nil, err
-		}
-	}
 	exists, err := ns.mounter.PathExists(req.GetVolumePath())
 	if err != nil {
 		span.SetStatus(otcodes.Error, "failed to check if path exists")
@@ -339,7 +336,7 @@ func (ns *Server) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolume
 	}, nil
 }
 
-func (ns *Server) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+func (ns *Server) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (out *csi.NodeStageVolumeResponse, resultErr error) {
 	ctx, span := ns.tracer.Start(ctx, "csi.v1.Node/NodeStageVolume", trace.WithAttributes(
 		attribute.String("vol.id", req.GetVolumeId()),
 	))
@@ -368,9 +365,11 @@ func (ns *Server) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeR
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	log := log.FromContext(ctx).WithName("NodeStageVolume").WithValues("volumeID", volumeID)
-	if err := core.BeforePhysical(ns.volume, volumeID); err != nil {
-		return nil, err
+	ctx, finish, gateErr := core.BeginPreparation(ctx, ns.volume, "NodeStageVolume", volumeID, ns.nodeID, req.GetVolumeCapability().GetBlock() != nil)
+	if gateErr != nil {
+		return nil, gateErr
 	}
+	defer core.CompleteNative(finish, &resultErr)
 
 	pvName, err := ns.volume.GetVolumeName(volumeID)
 	if err != nil {
@@ -542,7 +541,7 @@ func getCapacityAndLimit(attrs map[string]string, annotations map[string]string)
 	return capacityBytes, limitBytes, nil
 }
 
-func (ns *Server) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+func (ns *Server) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (out *csi.NodeUnstageVolumeResponse, resultErr error) {
 	ctx, span := ns.tracer.Start(ctx, "csi.v1.Node/NodeUnstageVolume", trace.WithAttributes(
 		attribute.String("vol.id", req.GetVolumeId()),
 	))
@@ -561,9 +560,11 @@ func (ns *Server) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVol
 	}
 
 	log := log.FromContext(ctx).WithName("NodeUnstageVolume").WithValues("volumeID", volumeID)
-	if err := core.BeforePhysical(ns.volume, volumeID); err != nil {
-		return nil, err
+	ctx, finish, gateErr := core.BeginPhysical(ctx, ns.volume, "NodeUnstageVolume", volumeID)
+	if gateErr != nil {
+		return nil, gateErr
 	}
+	defer core.CompleteNative(finish, &resultErr)
 
 	log.V(2).Info("NodeUnstageVolume deferring target path unmount to DeleteVolume")
 
@@ -571,7 +572,7 @@ func (ns *Server) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVol
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
-func (ns *Server) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+func (ns *Server) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (out *csi.NodeExpandVolumeResponse, resultErr error) {
 	ctx, span := ns.tracer.Start(ctx, "csi.v1.Node/NodeExpandVolume", trace.WithAttributes(
 		attribute.String("vol.id", req.GetVolumeId()),
 	))
@@ -597,6 +598,11 @@ func (ns *Server) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolum
 	}
 
 	log := log.FromContext(ctx).WithName("NodeExpandVolume").WithValues("volumeID", req.GetVolumeId(), "capacityBytes", req.GetCapacityRange().GetRequiredBytes())
+	ctx, finish, gateErr := core.BeginPhysical(ctx, ns.volume, "NodeExpandVolume", req.GetVolumeId())
+	if gateErr != nil {
+		return nil, gateErr
+	}
+	defer core.CompleteNative(finish, &resultErr)
 
 	pvName, err := ns.volume.GetVolumeName(req.GetVolumeId())
 	if err != nil {

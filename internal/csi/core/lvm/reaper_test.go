@@ -16,7 +16,7 @@ import (
 	kevents "k8s.io/client-go/tools/events"
 
 	"local-csi-driver/internal/csi/core/lvm"
-	"local-csi-driver/internal/devicelease"
+	"local-csi-driver/internal/deviceuse"
 	lvmMgr "local-csi-driver/internal/pkg/lvm"
 )
 
@@ -69,13 +69,13 @@ func expectVolumeGroup(m *lvmMgr.MockManager) {
 		AnyTimes()
 }
 
-func TestRawCacheReaperSkipsEvenIfMistagged(t *testing.T) {
+func TestRetiredPrivateVGIsExcludedEvenIfMistagged(t *testing.T) {
 	r := newTestReaper(t, func(m *lvmMgr.MockManager) {
 		m.EXPECT().ListVolumeGroups(gomock.Any(), gomock.Any()).Return([]lvmMgr.VolumeGroup{
-			{Name: devicelease.Group}, {Name: testVolumeGroup},
+			{Name: deviceuse.RetiredRawVG}, {Name: testVolumeGroup},
 		}, nil)
 		m.EXPECT().ListLogicalVolumes(gomock.Any(), &lvmMgr.ListLVOptions{Names: []string{testVolumeGroup}}).
-			Return([]lvmMgr.LogicalVolume{{VGName: devicelease.Group, Name: testWipeName, Tags: lvm.WipePendingTag}}, nil)
+			Return([]lvmMgr.LogicalVolume{{VGName: deviceuse.RetiredRawVG, Name: testWipeName, Tags: lvm.WipePendingTag}}, nil)
 	})
 	if err := r.Reconcile(t.Context()); err != nil {
 		t.Fatal(err)

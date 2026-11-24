@@ -19,7 +19,7 @@ import (
 	"local-csi-driver/internal/csi/core"
 	"local-csi-driver/internal/csi/core/lvm"
 	"local-csi-driver/internal/csi/mounter"
-	"local-csi-driver/internal/devicelease"
+	"local-csi-driver/internal/deviceuse"
 	lvmMgr "local-csi-driver/internal/pkg/lvm"
 )
 
@@ -106,7 +106,7 @@ func (r *LVMOrphanScanner) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 
 		for _, lv := range lvs {
-			if lv.VGName == devicelease.Group || !devicelease.OrdinaryTarget(vgName, lv.Name) {
+			if lv.VGName == deviceuse.RetiredRawVG || !deviceuse.ValidTarget(vgName, lv.Name) {
 				continue
 			}
 			// Skip volumes that are already committed to sanitization.
@@ -219,7 +219,7 @@ func (r *LVMOrphanScanner) cleanupOrphanedVolumes(ctx context.Context, volumeIDs
 }
 
 // deleteOrphanedVolume deletes a single orphaned volume.
-func (r *LVMOrphanScanner) deleteOrphanedVolume(ctx context.Context, volumeID string) error {
+func (r *LVMOrphanScanner) deleteOrphanedVolume(ctx context.Context, volumeID string) (resultErr error) {
 	log := log.FromContext(ctx).WithName("lvm-orphan-scanner")
 
 	log.Info("Deleting orphaned LVM volume", "volumeID", volumeID)
@@ -230,9 +230,11 @@ func (r *LVMOrphanScanner) deleteOrphanedVolume(ctx context.Context, volumeID st
 		"Cleaning up orphaned LVM logical volume %s on node %s (no corresponding PV found)", volumeID, r.nodeID)
 
 	// Get device path and unmount before deletion
-	if err := core.BeforePhysical(r.lvmManager, volumeID); err != nil {
-		return err
+	ctx, finish, gateErr := core.BeginPhysical(ctx, r.lvmManager, "OrphanCleanup", volumeID)
+	if gateErr != nil {
+		return gateErr
 	}
+	defer core.CompleteNative(finish, &resultErr)
 	devicePath, err := r.lvmManager.GetNodeDevicePath(volumeID)
 	if err != nil {
 		log.V(2).Info("Could not get device path, proceeding with deletion", "volumeID", volumeID, "error", err.Error())

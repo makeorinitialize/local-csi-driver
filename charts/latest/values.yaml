@@ -99,12 +99,10 @@ diskSelection:
   # Additional device types to select, appended to the built-in defaults.
   addonTypes: []
 
-# Inactive raw LV reservations. RPC serving requires a second explicit opt-in.
-rawCache:
+# Opt-in authenticated source-use gates. Provision protected config and state first.
+deviceUse:
   enabled: false
-  rpc:
-    enabled: false
-    port: 9711
+  port: 9711
 
 # Garbage collection and cleanup configuration.
 cleanup:

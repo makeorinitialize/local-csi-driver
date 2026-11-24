@@ -9,14 +9,14 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"go.uber.org/mock/gomock"
 
-	"local-csi-driver/internal/devicelease"
+	"local-csi-driver/internal/deviceuse"
 	lvmMgr "local-csi-driver/internal/pkg/lvm"
 	"local-csi-driver/internal/pkg/probe"
 	"local-csi-driver/internal/pkg/telemetry"
 )
 
 func TestCanaryRegistrationAndExclusiveVG(t *testing.T) {
-	const name, group = "localdisk.dmstack.infinitydb.io", "dmstack-canary"
+	const name, group = "localdisk.compositedisk.infinitydb.io", "compositedisk-canary"
 	if err := ConfigureCanary(name, group); err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestCanaryRegistrationAndExclusiveVG(t *testing.T) {
 		t.Fatal(err)
 	}
 	if l.GetDriverName() != name || l.GetCSIDriver().Name != name || DefaultVolumeGroupTag == "local-csi" ||
-		DefaultVolumeGroupTag != devicelease.OrdinaryVGTag(name) {
+		DefaultVolumeGroupTag != deviceuse.VGTag(name) {
 		t.Fatal("canary would register or scan as the managed addon")
 	}
 	lv := "pvc-12345678-1234-1234-1234-123456789abc"
@@ -38,8 +38,8 @@ func TestCanaryRegistrationAndExclusiveVG(t *testing.T) {
 		v.VolumeContext[name+"/capacity"] != "4096" {
 		t.Fatal("actual CreateVolume did not use independent CSI identity", v, err)
 	}
-	for _, id := range []string{"containerstorage#" + lv, "other#" + lv, "mapper#dmstack--canary-" + lv, group + "#../" + lv} {
-		if err := l.BeforePhysical(id, ""); err == nil {
+	for _, id := range []string{"containerstorage#" + lv, "other#" + lv, "mapper#compositedisk--canary-" + lv, group + "#../" + lv} {
+		if _, _, err := l.BeginNative(t.Context(), "DeleteVolume", id, ""); err == nil {
 			t.Fatal("accepted foreign/alias native operation", id)
 		}
 		if _, err := l.GetNodeDevicePath(id); err == nil {

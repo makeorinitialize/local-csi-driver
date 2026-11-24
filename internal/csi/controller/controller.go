@@ -142,7 +142,7 @@ func (cs *Server) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest
 	return &csi.CreateVolumeResponse{Volume: vol}, nil
 }
 
-func (cs *Server) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+func (cs *Server) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (out *csi.DeleteVolumeResponse, resultErr error) {
 	ctx, span := cs.tracer.Start(ctx, "csi.v1.Controller/DeleteVolume", trace.WithAttributes(
 		attribute.String("vol.id", req.GetVolumeId()),
 	))
@@ -245,9 +245,11 @@ func (cs *Server) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest
 	}
 	span.SetAttributes(attribute.String("device.path", devicePath))
 
-	if err := core.BeforePhysical(cs.volume, req.GetVolumeId()); err != nil {
-		return nil, err
+	ctx, finish, gateErr := core.BeginPhysical(ctx, cs.volume, "DeleteVolume", req.GetVolumeId())
+	if gateErr != nil {
+		return nil, gateErr
 	}
+	defer core.CompleteNative(finish, &resultErr)
 	if devicePath != "" {
 		log.V(2).Info("unmounting volume before deletion", "devicePath", devicePath)
 		if err := cs.mounter.CleanupStagingDir(ctx, devicePath); err != nil {

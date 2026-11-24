@@ -12,10 +12,10 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 
-	"local-csi-driver/internal/devicelease"
+	"local-csi-driver/internal/deviceuse"
 )
 
-const OfficialDriverName = devicelease.OfficialCacheDriver
+const OfficialDriverName = deviceuse.OfficialCacheDriver
 
 var canaryVolumeGroup string
 
@@ -32,11 +32,11 @@ func ConfigureCanary(name, group string) error {
 		csiDriver.Spec.VolumeLifecycleModes = []storagev1.VolumeLifecycleMode{storagev1.VolumeLifecyclePersistent, storagev1.VolumeLifecycleEphemeral}
 	} else {
 		if len(name) == 0 || len(name) > 63 || len(validation.IsDNS1123Subdomain(name)) != 0 ||
-			name == devicelease.OfficialOriginDriver || group == "containerstorage" || group == "mapper" ||
-			!devicelease.OrdinaryTarget(group, "volume") {
+			name == "disk.csi.azure.com" || group == "containerstorage" || group == "mapper" ||
+			!deviceuse.ValidTarget(group, "volume") {
 			return fmt.Errorf("canary requires an exact separate CSI name and private nondefault VG")
 		}
-		DriverName, DefaultVolumeGroup, DefaultVolumeGroupTag = name, group, devicelease.OrdinaryVGTag(name)
+		DriverName, DefaultVolumeGroup, DefaultVolumeGroupTag = name, group, deviceuse.VGTag(name)
 		canaryVolumeGroup = group
 		csiDriver.Spec.VolumeLifecycleModes = []storagev1.VolumeLifecycleMode{storagev1.VolumeLifecyclePersistent}
 	}
@@ -51,7 +51,7 @@ func checkCanaryTarget(id string) error {
 		return nil
 	}
 	vg, lv, ok := strings.Cut(id, "#")
-	if !ok || vg != canaryVolumeGroup || !devicelease.OrdinaryTarget(vg, lv) {
+	if !ok || vg != canaryVolumeGroup || !deviceuse.ValidTarget(vg, lv) {
 		return status.Error(codes.FailedPrecondition, "outside the private canonical canary VG")
 	}
 	return nil

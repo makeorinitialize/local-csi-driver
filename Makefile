@@ -209,7 +209,7 @@ build: build-driver build-manager ## Build driver and manager binaries.
 
 .PHONY: build-driver
 build-driver: fmt fix vet ## Build driver binary.
-	go build -ldflags "$(LDFLAGS)" -o bin/local-csi-driver cmd/driver/main.go
+	go build -ldflags "$(LDFLAGS)" -o bin/local-csi-driver ./cmd/driver
 
 .PHONY: build-manager
 build-manager: fmt fix vet ## Build manager binary.
@@ -217,7 +217,7 @@ build-manager: fmt fix vet ## Build manager binary.
 
 .PHONY: run
 run: fmt fix vet ## Run the local CSI driver from your host.
-	go run ./cmd/driver/main.go
+	go run ./cmd/driver
 
 .PHONY: docker-build
 docker-build: docker-build-driver docker-build-manager
