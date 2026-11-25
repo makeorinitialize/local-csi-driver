@@ -81,8 +81,8 @@ spec:
         - --pod-name=$(POD_NAME)
         - --pod-uid=$(POD_UID)
         - --namespace=$(POD_NAMESPACE)
-        - --csi-node-bind-address=unix:///csi-node/csi.sock
-        - --csi-controller-bind-address=unix:///csi-controller/csi.sock
+        - --csi-node-bind-address=unix:///plugin/csi.sock
+        - --csi-controller-bind-address=unix:///plugin/csi-controller.sock
         - --worker-threads={{ .Values.scalability.driver.workerThreads }}
         - --kube-api-qps={{ .Values.scalability.driver.kubeApi.qps }}
         - --kube-api-burst={{ .Values.scalability.driver.kubeApi.burst }}
@@ -182,17 +182,15 @@ spec:
           readOnly: true
         - mountPath: /dev
           name: device
-        - mountPath: /csi-node
+        - mountPath: /plugin
           name: node-socket-dir
-        - mountPath: /csi-controller
-          name: controller-socket-dir
         - mountPath: /var/lib/kubelet/
           mountPropagation: Bidirectional
           name: mountpoint-dir
 
       - name: csi-provisioner
         args:
-        - --csi-address=/csi-controller/csi.sock
+        - --csi-address=/plugin/csi-controller.sock
         - --node-deployment
         - --http-endpoint=:{{ .Values.observability.csiProvisioner.http.port }}
         - --retry-interval-start=1s
@@ -246,12 +244,12 @@ spec:
         - name: api-credentials
           mountPath: /var/run/secrets/kubernetes.io/serviceaccount
           readOnly: true
-        - mountPath: /csi-controller
-          name: controller-socket-dir
+        - mountPath: /plugin
+          name: node-socket-dir
 
       - name: csi-resizer
         args:
-        - --csi-address=/csi-controller/csi.sock
+        - --csi-address=/plugin/csi-controller.sock
         - --timeout=240s
         - --feature-gates=VolumeAttributesClass=false
         - --handle-volume-inuse-error=false
@@ -279,12 +277,12 @@ spec:
         - name: api-credentials
           mountPath: /var/run/secrets/kubernetes.io/serviceaccount
           readOnly: true
-        - mountPath: /csi-controller
-          name: controller-socket-dir
+        - mountPath: /plugin
+          name: node-socket-dir
 
       - name: csi-registrar
         args:
-        - --csi-address=/csi-node/csi.sock
+        - --csi-address=/plugin/csi.sock
         - --kubelet-registration-path=/var/lib/kubelet/plugins/{{ .Values.driver.name }}/csi.sock
         - --http-endpoint=:{{ .Values.observability.nodeDriverRegistrar.http.port }}
         - --v={{ .Values.observability.nodeDriverRegistrar.log.level }}
@@ -311,7 +309,7 @@ spec:
             drop:
               - ALL
         volumeMounts:
-        - mountPath: /csi-node
+        - mountPath: /plugin
           name: node-socket-dir
         - mountPath: /registration
           name: registration-dir
@@ -365,8 +363,6 @@ spec:
           path: /var/lib/kubelet/plugins/{{ .Values.driver.name }}/
           type: DirectoryOrCreate
         name: node-socket-dir
-      - name: controller-socket-dir
-        emptyDir: {}
       - hostPath:
           path: /var/lib/kubelet/plugins_registry/
           type: Directory
